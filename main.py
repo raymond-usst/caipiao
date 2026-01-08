@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import argparse
 import sys
+import os
 from pathlib import Path
 import pandas as pd
 import numpy as np
 import numpy as np
 
+# 统一控制台编码为 UTF-8，避免中文输出乱码（Windows PowerShell 常见）
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 from lottery import analyzer, database, scraper, blender
-from lottery import ml_model, seq_model, tft_model, nhits_model, timesnet_model, prophet_model, validation
+from lottery import ml_model, seq_model, tft_model, nhits_model, timesnet_model, prophet_model, validation, odd_model, sum_model
 
 
 def cmd_sync(args) -> None:
@@ -265,7 +273,14 @@ def cmd_predict(args) -> None:
             return seq_model.predict_seq(seq_m, seq_cfg, hist_df)
 
         base_predictors.append(pred_seq)
-        print("[predict][seq] 已加入融合")
+        print("[predict][seq] added to blend")
+
+        if getattr(args, "seq_backtest", False):
+            try:
+                bt = seq_model.backtest_seq_model(seq_m, seq_cfg, df, batch_size=args.seq_backtest_batch)
+                print(f"[predict][seq][backtest] red_top1={bt['red_top1']:.3f}, blue_top1={bt['blue_top1']:.3f}, samples={bt['samples']}")
+            except Exception as e:
+                print(f"[predict][seq][backtest][warn] {e}")
     except Exception as e:
         print(f"[predict][seq][warn] 跳过: {e}")
 
@@ -326,7 +341,14 @@ def cmd_predict(args) -> None:
             return tft_model.predict_tft(tft_m, tft_cfg, hist_df)
 
         base_predictors.append(pred_tft)
-        print("[predict][tft] 已加入融合")
+        print("[predict][tft] added to blend")
+
+        if getattr(args, "tft_backtest", False):
+            try:
+                bt = tft_model.backtest_tft_model(tft_m, tft_cfg, df, batch_size=args.tft_backtest_batch)
+                print(f"[predict][tft][backtest] red_top1={bt['red_top1']:.3f}, blue_top1={bt['blue_top1']:.3f}, samples={bt['samples']}")
+            except Exception as e:
+                print(f"[predict][tft][backtest][warn] {e}")
     except Exception as e:
         print(f"[predict][tft][warn] 跳过: {e}")
 
@@ -362,10 +384,23 @@ def cmd_predict(args) -> None:
         nh_m, nh_cfg = nhits_model.train_nhits(df, nh_cfg, save_dir="models", resume=nh_resume, fresh=nh_fresh)
 
         def pred_nh(hist_df):
-            return nhits_model.predict_nhits(nh_m, nh_cfg, hist_df)
+            out = nhits_model.predict_nhits(nh_m, nh_cfg, hist_df)
+            # 将全局红球概率复制到各位置，蓝球直接用 blue_probs
+            if out.get("red_probs"):
+                red_probs = out["red_probs"]
+                out["red"] = {pos: red_probs for pos in range(1, 7)}
+            if out.get("blue_probs"):
+                out["blue"] = out["blue_probs"]
+            return out
 
         base_predictors.append(pred_nh)
-        print("[predict][nhits] 已加入融合")
+        if getattr(args, "nhits_backtest", False):
+            try:
+                bt = nhits_model.backtest_nhits_model(nh_cfg, df, batch_size=args.nhits_backtest_batch)
+                print(f"[predict][nhits][backtest] sum_mae={bt['sum_mae']:.3f}, blue_acc={bt['blue_acc']:.3f}, samples={bt['samples']}")
+            except Exception as e:
+                print(f"[predict][nhits][backtest][warn] {e}")
+        print("[predict][nhits] added to blend")
     except Exception as e:
         print(f"[predict][nhits][warn] 跳过: {e}")
 
@@ -409,10 +444,16 @@ def cmd_predict(args) -> None:
         tn_m, tn_cfg = timesnet_model.train_timesnet(df, tn_cfg, save_dir="models", resume=tn_resume, fresh=tn_fresh)
 
         def pred_tn(hist_df):
-            return timesnet_model.predict_timesnet(tn_m, hist_df)
+            out = timesnet_model.predict_timesnet(tn_m, hist_df)
+            if out.get("red_probs"):
+                red_probs = out["red_probs"]
+                out["red"] = {pos: red_probs for pos in range(1, 7)}
+            if out.get("blue_probs"):
+                out["blue"] = out["blue_probs"]
+            return out
 
         base_predictors.append(pred_tn)
-        print("[predict][timesnet] 已加入融合")
+        print("[predict][timesnet] added to blend")
     except Exception as e:
         print(f"[predict][timesnet][warn] 跳过: {e}")
 
@@ -434,10 +475,15 @@ def cmd_predict(args) -> None:
         pr_m, pr_cfg = prophet_model.train_prophet(df, pr_cfg, save_dir="models", resume=pr_resume, fresh=pr_fresh)
 
         def pred_pr(hist_df):
-            return prophet_model.predict_prophet(pr_m, hist_df)
+            out = prophet_model.predict_prophet(pr_m, hist_df)
+            if out.get("red_probs"):
+                out["red"] = {pos: out["red_probs"] for pos in range(1, 7)}
+            if out.get("blue_probs"):
+                out["blue"] = out["blue_probs"]
+            return out
 
         base_predictors.append(pred_pr)
-        print("[predict][prophet] 已加入融合")
+        print("[predict][prophet] added to blend")
     except Exception as e:
         print(f"[predict][prophet][warn] 跳过: {e}")
 
@@ -445,13 +491,81 @@ def cmd_predict(args) -> None:
         print("[predict][blend] 基础模型不足2个，跳过融合")
         return
 
-    print(f"[predict][blend] 启用基础模型数: {len(base_predictors)}，开始融合...")
+    # 避免控制台乱码，使用 ASCII 文案
+    print(f"[predict][blend] start blend with {len(base_predictors)} base models...")
     fused_blue_num, fused_blue_prob = blender.blend_blue_latest(df, base_predictors)
     fused_sum = blender.blend_sum_latest(df, base_predictors)
     fused_red = blender.blend_red_latest(df, base_predictors)
     print(f"[predict][blend] 融合蓝球 Top1: {fused_blue_num} (prob={fused_blue_prob:.3f})")
     print(f"[predict][blend] 融合和值预测≈{fused_sum:.2f}")
     print(f"[predict][blend] 融合红球预测: {fused_red}")
+
+    # Stacking 元学习（蓝球 / 红球位置），使用概率向量特征
+    try:
+        stack_bayes = getattr(args, "stack_bayes", False)
+        n_calls = getattr(args, "stack_bayes_calls", 6)
+        # 蓝球 stacking
+        scaler_b, meta_b = blender.train_stacking_blue(df, base_predictors, bayes=stack_bayes, n_iter=n_calls)
+        stack_blue_num, stack_blue_prob = blender.predict_stacking_blue(df, base_predictors, scaler_b, meta_b)
+        print(f"[predict][stack] 蓝球 Top1: {stack_blue_num} (prob={stack_blue_prob:.3f})")
+        # 红球位置 stacking
+        scalers_r, models_r = blender.train_stacking_red(df, base_predictors, bayes=stack_bayes, n_iter=n_calls)
+        stack_red = blender.predict_stacking_red(df, base_predictors, scalers_r, models_r, topk=1)
+        print(f"[predict][stack] 红球位置 Top1: {stack_red}")
+    except Exception as e:
+        print(f"[predict][stack][warn] 跳过 stacking: {e}")
+
+    # 基于高概率红/蓝生成约束复式组合（和值范围由预测均值±预测标准差，奇偶默认3:3，若有奇偶预测则替换）
+    try:
+        fused_sum_int = int(round(fused_sum)) if fused_sum is not None else None
+        sum_std = None
+        try:
+            sum_cfg = sum_model.SumStdConfig(window=args.window, iterations=150, depth=6, learning_rate=0.05)
+            sum_m = sum_model.train_sumstd_model(df, sum_cfg, save_dir="models", resume=not args.cat_no_resume, fresh=False)
+            sum_std = sum_model.predict_sumstd(sum_m, df, sum_cfg)
+            print(f"[predict][sumstd] 预测和值标准差≈{sum_std:.2f}")
+        except Exception as e:
+            print(f"[predict][sumstd][warn] 跳过: {e}")
+        if fused_sum_int is not None:
+            pad = int(max(3, round(sum_std))) if sum_std is not None else 5
+            sum_range = (fused_sum_int - pad, fused_sum_int + pad)
+        else:
+            sum_range = None
+        odd_hint = None
+        try:
+            # 奇偶模型：从窗口中预测下一期红球奇数个数
+            odd_cfg = odd_model.OddConfig(window=args.window, iterations=120, depth=6, learning_rate=0.05, topk=3)
+            odd_m = odd_model.train_odd_model(df, odd_cfg, save_dir="models", resume=not args.cat_no_resume, fresh=False)
+            odd_pred = odd_model.predict_odd(odd_m, df, odd_cfg)
+            odd_hint = odd_pred["odd_pred"]
+            print(f"[predict][odd] 奇数个数Top1={odd_pred['odd_pred']} 概率={odd_pred['odd_probs'][0][1]:.3f}")
+        except Exception as e:
+            print(f"[predict][odd][warn] 跳过: {e}")
+        duplex = blender.generate_duplex_combos(
+            df,
+            base_predictors,
+            top_red=10,
+            top_blue=5,
+            sum_range=sum_range,
+            odd_count=odd_hint if odd_hint is not None else 3,
+            max_combos=10,
+        )
+        if duplex:
+            print("[predict][duplex] 推荐复式(前10):")
+            for idx, c in enumerate(duplex, 1):
+                reds = " ".join(f"{n:02d}" for n in c["reds"])
+                print(f"  #{idx}: 红[{reds}] 蓝[{c['blue']:02d}] sum={c['sum']} odd={c['odd']} score={c['score']:.3f}")
+    except Exception as e:
+        print(f"[predict][duplex][warn] 生成失败: {e}")
+
+    # 杀号：概率极低(<0.01%)的红/蓝
+    try:
+        kill = blender.kill_numbers(df, base_predictors, red_thresh=1e-4, blue_thresh=1e-4)
+        if kill["red_kill"] or kill["blue_kill"]:
+            print(f"[predict][kill] 红可剔除: {kill['red_kill']}")
+            print(f"[predict][kill] 蓝可剔除: {kill['blue_kill']}")
+    except Exception as e:
+        print(f"[predict][kill][warn] 计算失败: {e}")
 
 
 def cmd_predict_seq(args) -> None:
@@ -945,6 +1059,12 @@ def cmd_train_all(args) -> None:
                 return nhits_model.predict_nhits(nh_m, nh_cfg, hist_df)
 
             base_predictors.append(pred_nh)
+            if getattr(args, "nhits_backtest", False):
+                try:
+                    bt = nhits_model.backtest_nhits_model(nh_m, nh_cfg, df, max_samples=args.nhits_backtest_samples)
+                    print(f"[predict][nhits][backtest] blue_top1={bt['blue_top1']:.3f}, samples={bt['samples']}")
+                except Exception as e:
+                    print(f"[predict][nhits][backtest][warn] {e}")
 
         # 5) TimesNet（蓝球点预测）
         if args.run_timesnet and len(df) >= args.timesnet_input + 1:
@@ -967,6 +1087,12 @@ def cmd_train_all(args) -> None:
                 return timesnet_model.predict_timesnet(tn_m, hist_df)
 
             base_predictors.append(pred_tn)
+            if getattr(args, "timesnet_backtest", False):
+                try:
+                    bt = timesnet_model.backtest_timesnet_model(tn_m, tn_cfg, df, max_samples=args.timesnet_backtest_samples)
+                    print(f"[predict][timesnet][backtest] blue_top1={bt['blue_top1']:.3f}, samples={bt['samples']}")
+                except Exception as e:
+                    print(f"[predict][timesnet][backtest][warn] {e}")
 
         # 6) Prophet（蓝球点预测）
         if args.run_prophet and len(df) >= 30:
@@ -1037,19 +1163,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_pred.add_argument("--bayes-seq", action="store_true", help="启用 Transformer 贝叶斯调参")
     p_pred.add_argument("--bayes-seq-calls", type=int, default=6, help="Transformer 贝叶斯搜索迭代次数")
     p_pred.add_argument("--bayes-seq-recent", type=int, default=300, help="Transformer 贝叶斯调参使用的最近样本数")
+    p_pred.add_argument("--seq-backtest", action="store_true", help="对 Transformer 进行流式回测")
+    p_pred.add_argument("--seq-backtest-batch", type=int, default=128, help="回测批大小")
     p_pred.add_argument("--bayes-tft", action="store_true", help="启用 TFT 贝叶斯调参")
     p_pred.add_argument("--bayes-tft-calls", type=int, default=4, help="TFT 贝叶斯搜索迭代次数")
     p_pred.add_argument("--bayes-tft-recent", type=int, default=400, help="TFT 贝叶斯调参使用的最近样本数")
+    p_pred.add_argument("--tft-backtest", action="store_true", help="对 TFT 进行流式回测")
+    p_pred.add_argument("--tft-backtest-batch", type=int, default=128, help="TFT 回测批大小")
     p_pred.add_argument("--nhits-fresh", action="store_true", help="强制重训 N-HiTS 并覆盖保存")
     p_pred.add_argument("--nhits-no-resume", action="store_true", help="不加载已保存 N-HiTS 模型")
     p_pred.add_argument("--bayes-nhits", action="store_true", help="启用 N-HiTS 贝叶斯调参")
     p_pred.add_argument("--bayes-nhits-calls", type=int, default=4, help="N-HiTS 贝叶斯搜索迭代次数")
     p_pred.add_argument("--bayes-nhits-recent", type=int, default=300, help="N-HiTS 贝叶斯调参使用的最近样本数")
+    p_pred.add_argument("--nhits-backtest", action="store_true", help="对 N-HiTS 进行流式回测")
+    p_pred.add_argument("--nhits-backtest-samples", type=int, default=300, help="N-HiTS 回测滑动样本数上限")
     p_pred.add_argument("--timesnet-fresh", action="store_true", help="强制重训 TimesNet 并覆盖保存")
     p_pred.add_argument("--timesnet-no-resume", action="store_true", help="不加载已保存 TimesNet 模型")
     p_pred.add_argument("--bayes-timesnet", action="store_true", help="启用 TimesNet 贝叶斯调参")
     p_pred.add_argument("--bayes-timesnet-calls", type=int, default=4, help="TimesNet 贝叶斯搜索迭代次数")
     p_pred.add_argument("--bayes-timesnet-recent", type=int, default=400, help="TimesNet 贝叶斯调参使用的最近样本数")
+    p_pred.add_argument("--timesnet-backtest", action="store_true", help="对 TimesNet 进行流式回测")
+    p_pred.add_argument("--timesnet-backtest-samples", type=int, default=300, help="TimesNet 回测滑动样本数上限")
+    p_pred.add_argument("--stack-bayes", action="store_true", help="对 stacking 元模型启用贝叶斯调参")
+    p_pred.add_argument("--stack-bayes-calls", type=int, default=6, help="stacking 贝叶斯搜索迭代次数")
     p_pred.add_argument("--prophet-fresh", action="store_true", help="强制重训 Prophet 并覆盖保存")
     p_pred.add_argument("--prophet-no-resume", action="store_true", help="不加载已保存 Prophet 模型")
     p_pred.add_argument("--bayes-prophet", action="store_true", help="启用 Prophet 贝叶斯调参")

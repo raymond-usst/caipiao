@@ -8,8 +8,12 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 from torch.optim import Adam
+from .features import build_features
+import torch.nn.functional as F
+
+COMBO_VOCAB = 20000  # 红球组合哈希桶
 
 
 def _entropy(counts: np.ndarray) -> float:
@@ -20,11 +24,18 @@ def _entropy(counts: np.ndarray) -> float:
     return float(-(p * np.log2(p)).sum())
 
 
+def combo_hash(reds: np.ndarray) -> int:
+    """对排序后的红球组合做哈希映射，位置无关组合特征。"""
+    reds_sorted = tuple(sorted(int(x) for x in reds))
+    return hash(reds_sorted) % COMBO_VOCAB
+
+
 def _build_feature_matrix(df: pd.DataFrame, freq_window: int = 50, entropy_window: int = 50) -> np.ndarray:
     cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
     data = df[cols].to_numpy(dtype=int)
     n = len(data)
     feat_list = []
+    extra_feats = build_features(df).to_numpy(dtype=float)
     red_hist = np.zeros(34)  # 1..33
     blue_hist = np.zeros(17)  # 1..16
     red_counts_window = []
@@ -80,6 +91,7 @@ def _build_feature_matrix(df: pd.DataFrame, freq_window: int = 50, entropy_windo
                 reds_norm,
                 blue_norm,
                 [s, odd, span, red_freq, blue_freq, red_entropy, dow_sin, dow_cos, mon_sin, mon_cos],
+                extra_feats[i],
             ]
         )
         feat_list.append(feat)
@@ -92,22 +104,57 @@ class TFTDataset(Dataset):
         data = df[cols].to_numpy(dtype=int)
         feats = _build_feature_matrix(df, freq_window=freq_window, entropy_window=entropy_window)
         self.samples: List[Tuple[np.ndarray, np.ndarray]] = []
+        self.combo_ids: List[int] = []
         for i in range(window, len(data)):
             hist = feats[i - window : i]
             tgt = data[i]
-            self.samples.append((hist, tgt))
+            combo_id = combo_hash(tgt[:6])
+            self.samples.append((hist, tgt, combo_id))
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx):
-        hist, tgt = self.samples[idx]
-        return torch.tensor(hist, dtype=torch.float32), torch.tensor(tgt, dtype=torch.long)
+        hist, tgt, combo_id = self.samples[idx]
+        return (
+            torch.tensor(hist, dtype=torch.float32),
+            torch.tensor(tgt, dtype=torch.long),
+            torch.tensor(combo_id, dtype=torch.long),
+        )
 
 
 def collate_tft(batch):
-    xs, ys = zip(*batch)
-    return torch.stack(xs), torch.stack(ys)
+    xs, ys, combo = zip(*batch)
+    return torch.stack(xs), torch.stack(ys), torch.stack(combo)
+
+
+class StreamingTFTDataset(IterableDataset):
+    """
+    流式回测数据集，避免一次性展开所有样本。
+    """
+
+    def __init__(self, df: pd.DataFrame, window: int = 20, freq_window: int = 50, entropy_window: int = 50):
+        self.df = df
+        self.window = window
+        self.freq_window = freq_window
+        self.entropy_window = entropy_window
+
+    def __iter__(self):
+        cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
+        data = self.df[cols].to_numpy(dtype=int)
+        feats = _build_feature_matrix(self.df, freq_window=self.freq_window, entropy_window=self.entropy_window)
+        for i in range(self.window, len(data)):
+            hist = feats[i - self.window : i]
+            tgt = data[i]
+            combo_id = combo_hash(tgt[:6])
+            yield (
+                torch.tensor(hist, dtype=torch.float32),
+                torch.tensor(tgt, dtype=torch.long),
+                torch.tensor(combo_id, dtype=torch.long),
+            )
+
+    def __len__(self):
+        return max(0, len(self.df) - self.window)
 
 
 class GatedResidualNetwork(nn.Module):
@@ -136,6 +183,7 @@ class SimpleTFT(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.var_sel = GatedResidualNetwork(d_model, d_model, d_model, dropout)
         self.pool = nn.AdaptiveAvgPool1d(1)
+        self.combo_emb = nn.Embedding(COMBO_VOCAB, d_model)
         self.head_red = nn.ModuleList([nn.Linear(d_model, 33) for _ in range(6)])
         self.head_blue = nn.Linear(d_model, 16)
         # 多任务辅助头：和值回归、奇偶计数分类、跨度回归
@@ -143,12 +191,14 @@ class SimpleTFT(nn.Module):
         self.head_odd = nn.Linear(d_model, 7)  # 0-6 奇数个数
         self.head_span = nn.Linear(d_model, 1)
 
-    def forward(self, x):
+    def forward(self, x, combo_ids=None):
         # x: [B, L, F]
         h = self.input_proj(x)
         h = self.encoder(h)
         h = self.var_sel(h)
         pooled = self.pool(h.transpose(1, 2)).squeeze(-1)  # [B, d]
+        if combo_ids is not None:
+            pooled = pooled + self.combo_emb(combo_ids)
         reds = [head(pooled) for head in self.head_red]
         blue = self.head_blue(pooled)
         sum_pred = self.head_sum(pooled)
@@ -344,7 +394,13 @@ def train_tft(
             except Exception as e:
                 print(f"[TFT] 加载已保存模型失败，将重新训练: {e}")
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    loss_fn = nn.CrossEntropyLoss()
+    def focal_loss(logits: torch.Tensor, target: torch.Tensor, gamma: float = 2.0) -> torch.Tensor:
+        log_probs = torch.log_softmax(logits, dim=1)
+        probs = torch.exp(log_probs)
+        pt = probs.gather(1, target.unsqueeze(1)).squeeze(1)
+        log_pt = log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
+        loss = -((1 - pt) ** gamma) * log_pt
+        return loss.mean()
     mse = nn.MSELoss()
 
     model.train()
@@ -356,20 +412,20 @@ def train_tft(
         ep += 1
         total_loss = 0.0
         steps = 0
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
+        for x, y, combo in loader:
+            x, y, combo = x.to(device), y.to(device), combo.to(device)
             opt.zero_grad()
-            reds, blue, aux = model(x)
-            loss = loss_fn(blue, y[:, -1] - 1)
+            reds, blue, aux = model(x, combo_ids=combo)
+            loss = focal_loss(blue, y[:, -1] - 1)
             for i, head_out in enumerate(reds):
-                loss = loss + loss_fn(head_out, y[:, i] - 1)
+                loss = loss + focal_loss(head_out, y[:, i] - 1)
             sum_target = y[:, :7].sum(dim=1).float() / (33 * 6 + 16)
             odd_target = (y[:, :6] % 2).sum(dim=1)
             span_target = (y[:, :6].max(dim=1).values - y[:, :6].min(dim=1).values).float() / 33.0
             loss = (
                 loss
                 + cfg.aux_sum_weight * mse(aux["sum"].squeeze(-1), sum_target)
-                + cfg.aux_odd_weight * loss_fn(aux["odd"], odd_target)
+                + cfg.aux_odd_weight * focal_loss(aux["odd"], odd_target)
                 + cfg.aux_span_weight * mse(aux["span"].squeeze(-1), span_target)
             )
             loss.backward()
@@ -405,11 +461,13 @@ def predict_tft(model: SimpleTFT, cfg: TFTConfig, df: pd.DataFrame) -> Dict:
         raise ValueError("样本不足，无法预测")
     feats = _build_feature_matrix(df, freq_window=cfg.freq_window, entropy_window=cfg.entropy_window)
     seq = feats[-cfg.window :]
+    combo_id = combo_hash(data[-1, :6])
     x = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)
+    combo = torch.tensor([combo_id], dtype=torch.long)
     device = next(model.parameters()).device
-    x = x.to(device)
+    x, combo = x.to(device), combo.to(device)
     with torch.no_grad():
-        reds, blue, _ = model(x)
+        reds, blue, _ = model(x, combo_ids=combo)
     red_preds = {}
     for i, head_out in enumerate(reds):
         probs = torch.softmax(head_out[0], dim=0).cpu().numpy()
@@ -419,4 +477,37 @@ def predict_tft(model: SimpleTFT, cfg: TFTConfig, df: pd.DataFrame) -> Dict:
     top_idx_b = np.argsort(probs_b)[::-1][: cfg.topk]
     blue_preds = [(int(idx + 1), float(probs_b[idx])) for idx in top_idx_b]
     return {"red": red_preds, "blue": blue_preds}
+
+
+def backtest_tft_model(
+    model: SimpleTFT,
+    cfg: TFTConfig,
+    df: pd.DataFrame,
+    batch_size: int = 128,
+) -> Dict[str, float]:
+    """
+    大规模回测：使用 StreamingTFTDataset 流式遍历样本，计算 Top1 命中。
+    """
+    dataset = StreamingTFTDataset(df, window=cfg.window, freq_window=cfg.freq_window, entropy_window=cfg.entropy_window)
+    loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_tft)
+    device = next(model.parameters()).device
+    model.eval()
+    red_hits = []
+    blue_hits = []
+    with torch.no_grad():
+        for x, y, combo in loader:
+            x, y, combo = x.to(device), y.to(device), combo.to(device)
+            reds, blue, _ = model(x, combo_ids=combo)
+            probs_b = torch.softmax(blue, dim=1)
+            pred_b = torch.argmax(probs_b, dim=1) + 1
+            blue_true = y[:, -1]
+            blue_hits.extend((pred_b == blue_true).float().cpu().tolist())
+            for i, head_out in enumerate(reds):
+                probs_r = torch.softmax(head_out, dim=1)
+                pred_r = torch.argmax(probs_r, dim=1) + 1
+                red_true = y[:, i]
+                red_hits.extend((pred_r == red_true).float().cpu().tolist())
+    red_hit = float(np.mean(red_hits)) if red_hits else 0.0
+    blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
+    return {"red_top1": red_hit, "blue_top1": blue_hit, "samples": len(dataset)}
 

@@ -8,20 +8,136 @@ import pickle
 import os
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 os.environ.setdefault("LIGHTNING_PROGRESS_BAR", "0")
+import warnings
+warnings.filterwarnings("ignore", message=".*ModelSummary.*")
+warnings.filterwarnings("ignore", message=".*val_check_steps is greater than max_steps.*")
+import logging
 
 import pandas as pd
 from neuralforecast import NeuralForecast
 from neuralforecast.models import TimesNet
+from torch.utils.data import IterableDataset, DataLoader
+from .features import build_features
+import numpy as np
+import torch
+
+FEAT_COLS = [
+    "ac",
+    "span",
+    "sum_tail",
+    "odd_ratio",
+    "prime_ratio",
+    "big_ratio",
+    "omit_red_mean",
+    "omit_red_max",
+    "omit_blue",
+    "weekday",
+    "weekday_sin",
+    "weekday_cos",
+    "lunar_month",
+    "lunar_day",
+]
+
+# 静默 Lightning 冗余 info
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+logging.getLogger("neuralforecast").setLevel(logging.ERROR)
 
 
 def _build_timeseries(df: pd.DataFrame) -> pd.DataFrame:
-    """构造和值与蓝球的单变量时间序列."""
+    """构造和值与蓝球的单变量时间序列，附加历史特征作为 hist_exog。"""
     sums = df[["red1", "red2", "red3", "red4", "red5", "red6", "blue"]].sum(axis=1)
     blue = df["blue"]
     dates = pd.to_datetime(df["draw_date"])
+    feats = build_features(df)
     ts_sum = pd.DataFrame({"unique_id": "sum", "ds": dates, "y": sums})
     ts_blue = pd.DataFrame({"unique_id": "blue", "ds": dates, "y": blue})
+    for col in FEAT_COLS:
+        ts_sum[col] = feats[col].to_numpy()
+        ts_blue[col] = feats[col].to_numpy()
     return pd.concat([ts_sum, ts_blue], axis=0)
+
+
+class StreamingTimesNetDataset(IterableDataset):
+    """
+    流式回测数据集：逐步产出历史序列与目标值，包含外生特征。
+    """
+
+    def __init__(self, df: pd.DataFrame, input_size: int):
+        self.df = df
+        self.input_size = input_size
+
+    def __iter__(self):
+        ts = _build_timeseries(self.df)
+        for uid in ["sum", "blue"]:
+            sub = ts[ts["unique_id"] == uid].reset_index(drop=True)
+            y = sub["y"].to_numpy()
+            feats = sub[FEAT_COLS].to_numpy()
+            for i in range(self.input_size, len(sub)):
+                hist_y = y[i - self.input_size : i]
+                hist_x = feats[i - self.input_size : i]
+                tgt = y[i]
+                yield (
+                    torch.tensor(hist_y, dtype=torch.float32),
+                    torch.tensor(hist_x, dtype=torch.float32),
+                    torch.tensor(tgt, dtype=torch.float32),
+                    uid,
+                )
+
+    def __len__(self):
+        ts = _build_timeseries(self.df)
+        return sum(max(0, len(ts[ts["unique_id"] == uid]) - self.input_size) for uid in ["sum", "blue"])
+
+
+class StreamingTimesNetDataset(IterableDataset):
+    """
+    流式回测数据集，逐步产出历史序列与目标值（含外生特征）。
+    """
+
+    def __init__(self, df: pd.DataFrame, input_size: int):
+        self.df = df
+        self.input_size = input_size
+
+    def __iter__(self):
+        ts = _build_timeseries(self.df)
+        for uid in ["sum", "blue"]:
+            sub = ts[ts["unique_id"] == uid].reset_index(drop=True)
+            y = sub["y"].to_numpy()
+            feats = sub[FEAT_COLS].to_numpy()
+            for i in range(self.input_size, len(sub)):
+                hist_y = y[i - self.input_size : i]
+                hist_x = feats[i - self.input_size : i]
+                tgt = y[i]
+                yield (
+                    torch.tensor(hist_y, dtype=torch.float32),
+                    torch.tensor(hist_x, dtype=torch.float32),
+                    torch.tensor(tgt, dtype=torch.float32),
+                    uid,
+                )
+
+    def __len__(self):
+        ts = _build_timeseries(self.df)
+        return sum(max(0, len(ts[ts["unique_id"] == uid]) - self.input_size) for uid in ["sum", "blue"])
+
+
+def _softmax_from_value(val: float, max_num: int, temperature: float = 3.0):
+    classes = np.arange(1, max_num + 1, dtype=float)
+    logits = -((classes - val) / temperature) ** 2
+    logits = logits - logits.max()
+    probs = np.exp(logits)
+    probs = probs / probs.sum()
+    return [(int(n), float(p)) for n, p in zip(classes.astype(int), probs)]
+
+
+def _freq_probs(df: pd.DataFrame, max_num: int):
+    cols = ["red1", "red2", "red3", "red4", "red5", "red6"]
+    reds = df[cols].to_numpy(dtype=int).ravel()
+    counts = np.bincount(reds, minlength=max_num + 1)[1:]
+    logits = counts.astype(float)
+    logits = logits - logits.max()
+    probs = np.exp(logits)
+    probs = probs / probs.sum()
+    classes = np.arange(1, max_num + 1, dtype=int)
+    return [(int(n), float(p)) for n, p in zip(classes, probs)]
 
 
 @dataclass
@@ -58,6 +174,7 @@ def _eval_timesnet_loss(df: pd.DataFrame, cfg: TimesNetConfig, max_train: int = 
         batch_size=cfg.batch_size,
         random_seed=42,
         early_stop_patience_steps=cfg.early_stop_patience_steps,
+        hist_exog_list=FEAT_COLS,
     )
     if hasattr(model, "trainer_kwargs"):
         model.trainer_kwargs["logger"] = False
@@ -197,5 +314,175 @@ def predict_timesnet(nf: NeuralForecast, df: pd.DataFrame) -> Dict[str, float]:
     fcst = nf.predict(ts)
     sum_pred = float(fcst[fcst["unique_id"] == "sum"]["TimesNet"].iloc[-1])
     blue_pred = float(fcst[fcst["unique_id"] == "blue"]["TimesNet"].iloc[-1])
-    return {"sum_pred": sum_pred, "blue_pred": blue_pred}
+    blue_probs = _softmax_from_value(blue_pred, max_num=16, temperature=3.0)
+    red_probs = _freq_probs(df, max_num=33)
+    return {
+        "sum_pred": sum_pred,
+        "blue_pred": blue_pred,
+        "blue_probs": blue_probs,
+        "red_probs": red_probs,
+    }
+
+
+def backtest_timesnet_model(
+    nf: NeuralForecast,
+    cfg: TimesNetConfig,
+    df: pd.DataFrame,
+    max_samples: int = 300,
+) -> Dict[str, float]:
+    """
+    流式回测：逐步截取历史->预测下一期蓝球，统计 Top1 命中率。
+    不重新训练，仅用已训模型做滑动预测，样本数默认限制以控制耗时。
+    """
+    blue_hits = []
+    total = len(df)
+    start_idx = max(cfg.input_size, total - max_samples)
+    for i in range(start_idx, total - 1):
+        hist = df.iloc[: i + 1]
+        ts = _build_timeseries(hist)
+        try:
+            fcst = nf.predict(ts)
+            blue_pred = float(fcst[fcst["unique_id"] == "blue"]["TimesNet"].iloc[-1])
+            blue_probs = _softmax_from_value(blue_pred, max_num=16)
+            top1 = blue_probs[0][0]
+            true_b = int(df.iloc[i + 1]["blue"])
+            blue_hits.append(1.0 if top1 == true_b else 0.0)
+        except Exception:
+            continue
+    blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
+    return {"blue_top1": blue_hit, "samples": len(blue_hits)}
+
+
+class StreamingTimesNetDataset(IterableDataset):
+    """
+    流式回测数据集：按窗口构造 sum/blue 目标与特征。
+    """
+
+    def __init__(self, df: pd.DataFrame, cfg: TimesNetConfig):
+        self.df = df
+        self.cfg = cfg
+        self.window = cfg.input_size
+        self.feats = build_features(df)
+
+    def __iter__(self):
+        cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
+        data = self.df[cols].to_numpy(dtype=int)
+        for i in range(self.window, len(data)):
+            hist = data[i - self.window : i]
+            tgt_sum = hist[-1, :].sum()
+            tgt_blue = hist[-1, -1]
+            exog = self.feats.iloc[i - self.window : i].to_numpy(dtype=float)
+            yield (
+                torch.tensor(hist, dtype=torch.float32),
+                torch.tensor(tgt_sum, dtype=torch.float32),
+                torch.tensor(tgt_blue, dtype=torch.float32),
+                torch.tensor(exog, dtype=torch.float32),
+            )
+
+    def __len__(self):
+        return max(0, len(self.df) - self.window)
+
+
+def backtest_timesnet_model(
+    cfg: TimesNetConfig,
+    df: pd.DataFrame,
+    batch_size: int = 128,
+) -> Dict[str, float]:
+    """
+    大规模回测：使用流式数据集，简化评估和值 MAE 与蓝球命中。
+    """
+    dataset = StreamingTimesNetDataset(df, cfg)
+    loader = DataLoader(dataset, batch_size=batch_size)
+    ts = _build_timeseries(df)
+    val_size = max(cfg.valid_size, cfg.h)
+    model = TimesNet(
+        input_size=cfg.input_size,
+        h=cfg.h,
+        hidden_size=cfg.hidden_size,
+        top_k=cfg.top_k,
+        dropout=cfg.dropout,
+        learning_rate=cfg.learning_rate,
+        max_steps=max(50, min(cfg.max_steps, 200)),
+        batch_size=cfg.batch_size,
+        random_seed=42,
+        early_stop_patience_steps=cfg.early_stop_patience_steps,
+        hist_exog_list=FEAT_COLS,
+    )
+    if hasattr(model, "trainer_kwargs"):
+        model.trainer_kwargs["logger"] = False
+        model.trainer_kwargs["enable_progress_bar"] = False
+        model.trainer_kwargs["enable_model_summary"] = False
+    nf = NeuralForecast(models=[model], freq="D")
+    nf.fit(ts, val_size=val_size)
+
+    sum_mae = []
+    blue_acc = []
+    fcst_full = nf.predict(ts)
+    sum_pred = fcst_full[fcst_full["unique_id"] == "sum"]["TimesNet"].to_numpy()
+    blue_pred = fcst_full[fcst_full["unique_id"] == "blue"]["TimesNet"].to_numpy()
+    sums_true = ts[ts["unique_id"] == "sum"]["y"].to_numpy()
+    blues_true = ts[ts["unique_id"] == "blue"]["y"].to_numpy()
+    min_len = min(len(sum_pred), len(sums_true), len(blue_pred), len(blues_true))
+    if min_len > 0:
+        sum_mae.append(float(np.abs(sum_pred[-min_len:] - sums_true[-min_len:]).mean()))
+        blue_acc.append(float((np.round(blue_pred[-min_len:]) == blues_true[-min_len:]).mean()))
+    return {
+        "sum_mae": float(np.mean(sum_mae)) if sum_mae else float("inf"),
+        "blue_acc": float(np.mean(blue_acc)) if blue_acc else 0.0,
+        "samples": len(dataset),
+    }
+
+
+def backtest_timesnet_model(
+    nf: NeuralForecast,
+    cfg: TimesNetConfig,
+    df: pd.DataFrame,
+) -> Dict[str, float]:
+    """
+    使用全量预测结果计算 sum/blue MAE（流式数据集已准备好，但 TimesNet 预测接口一次性）。
+    """
+    ts = _build_timeseries(df)
+    fcst = nf.predict(ts)
+    pred_sum = fcst[fcst["unique_id"] == "sum"]["TimesNet"].to_numpy()
+    pred_blue = fcst[fcst["unique_id"] == "blue"]["TimesNet"].to_numpy()
+    y_sum = ts[ts["unique_id"] == "sum"]["y"].to_numpy()
+    y_blue = ts[ts["unique_id"] == "blue"]["y"].to_numpy()
+    min_len_sum = min(len(pred_sum), len(y_sum))
+    min_len_blue = min(len(pred_blue), len(y_blue))
+    mae_sum = float(np.mean(np.abs(pred_sum[-min_len_sum:] - y_sum[-min_len_sum:]))) if min_len_sum else float("inf")
+    mae_blue = float(np.mean(np.abs(pred_blue[-min_len_blue:] - y_blue[-min_len_blue:]))) if min_len_blue else float("inf")
+    return {"mae_sum": mae_sum, "mae_blue": mae_blue, "samples": len(ts) - cfg.input_size}
+
+
+def backtest_timesnet_model(
+    df: pd.DataFrame,
+    input_size: int,
+    batch_size: int = 128,
+) -> Dict[str, float]:
+    """
+    流式回测（简化）：使用历史频率近似 Top1，衡量基线命中。
+    注：TimesNet原生接口不便于逐批预测分类，此处提供轻量基准。
+    """
+    dataset = StreamingTimesNetDataset(df, input_size=input_size)
+    loader = DataLoader(dataset, batch_size=batch_size)
+
+    red_freq = np.bincount(df[["red1", "red2", "red3", "red4", "red5", "red6"]].to_numpy(dtype=int).ravel(), minlength=34)
+    red_top = np.argmax(red_freq[1:]) + 1
+    blue_freq = np.bincount(df["blue"].to_numpy(dtype=int), minlength=17)
+    blue_top = np.argmax(blue_freq[1:]) + 1
+
+    red_hits = []
+    blue_hits = []
+    for _, _, tgt, uid in loader:
+        tgt = tgt.numpy()
+        if uid[0] == "blue":
+            pred = blue_top
+            blue_hits.extend((pred == tgt).astype(float).tolist())
+        else:
+            pred = red_top
+            red_hits.extend((pred == tgt).astype(float).tolist())
+
+    red_hit = float(np.mean(red_hits)) if red_hits else 0.0
+    blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
+    return {"red_top1": red_hit, "blue_top1": blue_hit, "samples": len(dataset)}
 

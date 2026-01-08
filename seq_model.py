@@ -9,14 +9,18 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 from torch.optim import Adam
+from .features import build_features
+from .features import build_features
 
 
 PAD_ID = 0
 RED_OFFSET = 0
 BLUE_OFFSET = 33  # reds: 1-33, blues will be offset to 34-49
 VOCAB_SIZE = 33 + 16 + 1  # +1 for padding
+COMBO_VOCAB = 20000  # 哈希桶，用于红球组合 embedding
+FEAT_DIM = 14  # 手工特征维度
 
 
 def encode_draw(row: np.ndarray) -> List[int]:
@@ -26,10 +30,17 @@ def encode_draw(row: np.ndarray) -> List[int]:
     return reds + [blue]
 
 
+def combo_hash(reds: np.ndarray) -> int:
+    """对排序后的红球组合做哈希，映射到固定桶."""
+    reds_sorted = tuple(sorted(int(x) for x in reds))
+    return hash(reds_sorted) % COMBO_VOCAB
+
+
 class DrawDataset(Dataset):
     def __init__(self, df: pd.DataFrame, window: int = 20):
         cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
         data = df[cols].to_numpy(dtype=int)
+        feats_arr = build_features(df).to_numpy(dtype=float)
         self.window = window
         self.samples = []
         for i in range(window, len(data)):
@@ -37,18 +48,25 @@ class DrawDataset(Dataset):
             target = data[i]
             src_tokens = [t for draw in hist for t in encode_draw(draw)]
             tgt_tokens = encode_draw(target)
-            self.samples.append((src_tokens, tgt_tokens))
+            combo_id = combo_hash(target[:6])
+            feat_vec = feats_arr[i]
+            self.samples.append((src_tokens, tgt_tokens, combo_id, feat_vec))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        src, tgt = self.samples[idx]
-        return torch.tensor(src, dtype=torch.long), torch.tensor(tgt, dtype=torch.long)
+        src, tgt, combo_id, feat_vec = self.samples[idx]
+        return (
+            torch.tensor(src, dtype=torch.long),
+            torch.tensor(tgt, dtype=torch.long),
+            torch.tensor(combo_id, dtype=torch.long),
+            torch.tensor(feat_vec, dtype=torch.float32),
+        )
 
 
 def collate_batch(batch):
-    src_list, tgt_list = zip(*batch)
+    src_list, tgt_list, combo_list, feat_list = zip(*batch)
     max_len = max(len(x) for x in src_list)
     src_pad = []
     for src in src_list:
@@ -58,7 +76,40 @@ def collate_batch(batch):
         src_pad.append(src)
     src_pad = torch.stack(src_pad)
     tgt = torch.stack(tgt_list)  # shape [B, 7]
-    return src_pad, tgt
+    combo = torch.stack(combo_list)
+    feats = torch.stack(feat_list)
+    return src_pad, tgt, combo, feats
+
+
+class StreamingBacktestDataset(IterableDataset):
+    """
+    适用于大规模回测的流式数据集，避免一次性构造所有样本。
+    """
+
+    def __init__(self, df: pd.DataFrame, window: int = 20):
+        self.df = df
+        self.window = window
+
+    def __iter__(self):
+        cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
+        data = self.df[cols].to_numpy(dtype=int)
+        feats_arr = build_features(self.df).to_numpy(dtype=float)
+        for i in range(self.window, len(data)):
+            hist = data[i - self.window : i]
+            target = data[i]
+            src_tokens = [t for draw in hist for t in encode_draw(draw)]
+            tgt_tokens = encode_draw(target)
+            combo_id = combo_hash(target[:6])
+            feat_vec = feats_arr[i]
+            yield (
+                torch.tensor(src_tokens, dtype=torch.long),
+                torch.tensor(tgt_tokens, dtype=torch.long),
+                torch.tensor(combo_id, dtype=torch.long),
+                torch.tensor(feat_vec, dtype=torch.float32),
+            )
+
+    def __len__(self):
+        return max(0, len(self.df) - self.window)
 
 
 class PositionalEncoding(nn.Module):
@@ -84,14 +135,20 @@ class SeqModel(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.pool = nn.AdaptiveAvgPool1d(1)
+        self.combo_emb = nn.Embedding(COMBO_VOCAB, d_model)
+        self.feat_proj = nn.Linear(FEAT_DIM, d_model)
         self.head_red = nn.ModuleList([nn.Linear(d_model, 33) for _ in range(6)])
         self.head_blue = nn.Linear(d_model, 16)
 
-    def forward(self, src: torch.Tensor) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    def forward(self, src: torch.Tensor, combo_ids: torch.Tensor | None = None, feats: torch.Tensor | None = None) -> Tuple[List[torch.Tensor], torch.Tensor]:
         x = self.embed(src)
         x = self.pos(x)
         h = self.encoder(x)  # [B, L, d]
         pooled = self.pool(h.transpose(1, 2)).squeeze(-1)  # [B, d]
+        if combo_ids is not None:
+            pooled = pooled + self.combo_emb(combo_ids)
+        if feats is not None:
+            pooled = pooled + self.feat_proj(feats)
         reds = [head(pooled) for head in self.head_red]
         blue = self.head_blue(pooled)
         return reds, blue
@@ -118,6 +175,20 @@ def _seq_ckpt_path(save_dir: Path, cfg: TrainConfig) -> Path:
     return save_dir / f"{base}.pt"
 
 
+def _focal_loss(logits: torch.Tensor, target: torch.Tensor, gamma: float = 2.0, alpha: float | None = None) -> torch.Tensor:
+    """
+    简单 Focal Loss (multiclass): alpha 可为标量，gamma 默认 2.0
+    """
+    log_probs = torch.log_softmax(logits, dim=1)
+    probs = torch.exp(log_probs)
+    pt = probs.gather(1, target.unsqueeze(1)).squeeze(1)
+    log_pt = log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
+    loss = -((1 - pt) ** gamma) * log_pt
+    if alpha is not None:
+        loss = alpha * loss
+    return loss.mean()
+
+
 def _quick_seq_loss(df: pd.DataFrame, cfg: TrainConfig, max_epochs: int = 6) -> float:
     """
     用于贝叶斯优化的快速评估：短周期训练+返回最后一个epoch的平均loss。
@@ -136,19 +207,18 @@ def _quick_seq_loss(df: pd.DataFrame, cfg: TrainConfig, max_epochs: int = 6) -> 
         dropout=cfg.dropout,
     ).to(device)
     opt = Adam(model.parameters(), lr=cfg.lr)
-    loss_fn = nn.CrossEntropyLoss()
     model.train()
     last_loss = 1e3
     for _ in range(max_epochs):
         total = 0.0
         steps = 0
-        for src, tgt in loader:
-            src, tgt = src.to(device), tgt.to(device)
+        for src, tgt, combo, feats in loader:
+            src, tgt, combo, feats = src.to(device), tgt.to(device), combo.to(device), feats.to(device)
             opt.zero_grad()
-            reds, blue = model(src)
-            loss = loss_fn(blue, tgt[:, -1] - BLUE_OFFSET - 1)
+            reds, blue = model(src, combo_ids=combo, feats=feats)
+            loss = _focal_loss(blue, tgt[:, -1] - BLUE_OFFSET - 1)
             for i, head_out in enumerate(reds):
-                loss = loss + loss_fn(head_out, tgt[:, i] - 1)
+                loss = loss + _focal_loss(head_out, tgt[:, i] - 1)
             loss.backward()
             opt.step()
             total += loss.item()
@@ -265,7 +335,6 @@ def train_seq_model(
             except Exception as e:
                 print(f"[Transformer] 加载已保存模型失败，将重新训练: {e}")
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    loss_fn = nn.CrossEntropyLoss()
 
     model.train()
     prev_loss = None
@@ -276,13 +345,13 @@ def train_seq_model(
         ep += 1
         total_loss = 0.0
         steps = 0
-        for src, tgt in loader:
-            src, tgt = src.to(device), tgt.to(device)
+        for src, tgt, combo, feats in loader:
+            src, tgt, combo, feats = src.to(device), tgt.to(device), combo.to(device), feats.to(device)
             opt.zero_grad()
-            reds, blue = model(src)
-            loss = loss_fn(blue, tgt[:, -1] - BLUE_OFFSET - 1)
+            reds, blue = model(src, combo_ids=combo, feats=feats)
+            loss = _focal_loss(blue, tgt[:, -1] - BLUE_OFFSET - 1)
             for i, head_out in enumerate(reds):
-                loss = loss + loss_fn(head_out, tgt[:, i] - 1)
+                loss = loss + _focal_loss(head_out, tgt[:, i] - 1)
             loss.backward()
             opt.step()
             total_loss += loss.item()
@@ -315,12 +384,16 @@ def predict_seq(model: SeqModel, cfg: TrainConfig, df: pd.DataFrame) -> Dict:
     if len(data) < cfg.window:
         raise ValueError("样本不足，无法预测")
     seq = data[-cfg.window :]
+    combo_id = combo_hash(seq[-1, :6])
     tokens = [t for draw in seq for t in encode_draw(draw)]
+    feats = build_features(df).iloc[-1].to_numpy(dtype=float)
     x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0)
+    combo = torch.tensor([combo_id], dtype=torch.long)
+    feats_t = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
     device = next(model.parameters()).device
-    x = x.to(device)
+    x, combo, feats_t = x.to(device), combo.to(device), feats_t.to(device)
     with torch.no_grad():
-        reds, blue = model(x)
+        reds, blue = model(x, combo_ids=combo, feats=feats_t)
     red_preds = {}
     for i, head_out in enumerate(reds):
         probs = torch.softmax(head_out[0], dim=0).cpu().numpy()
@@ -330,4 +403,39 @@ def predict_seq(model: SeqModel, cfg: TrainConfig, df: pd.DataFrame) -> Dict:
     top_idx_b = np.argsort(probs_b)[::-1][: cfg.topk]
     blue_preds = [(int(idx + 1), float(probs_b[idx])) for idx in top_idx_b]
     return {"red": red_preds, "blue": blue_preds}
+
+
+def backtest_seq_model(
+    model: SeqModel,
+    cfg: TrainConfig,
+    df: pd.DataFrame,
+    batch_size: int = 128,
+) -> Dict[str, float]:
+    """
+    大规模回测：使用 IterableDataset 流式遍历全部样本，计算 Top1 命中。
+    """
+    dataset = StreamingBacktestDataset(df, window=cfg.window)
+    loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_batch)
+    device = next(model.parameters()).device
+    model.eval()
+    red_hits = []
+    blue_hits = []
+    with torch.no_grad():
+        for src, tgt, combo, feats in loader:
+            src, tgt, combo, feats = src.to(device), tgt.to(device), combo.to(device), feats.to(device)
+            reds, blue = model(src, combo_ids=combo, feats=feats)
+            # blue top1
+            probs_b = torch.softmax(blue, dim=1)
+            pred_b = torch.argmax(probs_b, dim=1) + 1
+            blue_true = tgt[:, -1] - BLUE_OFFSET
+            blue_hits.extend((pred_b == blue_true).float().cpu().tolist())
+            # red top1 per position
+            for i, head_out in enumerate(reds):
+                probs_r = torch.softmax(head_out, dim=1)
+                pred_r = torch.argmax(probs_r, dim=1) + 1
+                red_true = tgt[:, i]
+                red_hits.extend((pred_r == red_true).float().cpu().tolist())
+    red_hit = float(np.mean(red_hits)) if red_hits else 0.0
+    blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
+    return {"red_top1": red_hit, "blue_top1": blue_hit, "samples": len(dataset)}
 

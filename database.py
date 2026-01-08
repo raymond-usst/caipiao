@@ -55,6 +55,23 @@ def init_db(db_path: Path) -> None:
         conn.executescript(SCHEMA)
 
 
+def _validate_draw(d: Draw) -> None:
+    """基础校验，防止脏数据入库。"""
+    if len(d.reds) != 6:
+        raise ValueError(f"期号 {d.issue} 红球数量不是6个")
+    reds = [int(r) for r in d.reds]
+    if len(set(reds)) != 6:
+        raise ValueError(f"期号 {d.issue} 红球存在重复: {reds}")
+    for r in reds:
+        if r < 1 or r > 33:
+            raise ValueError(f"期号 {d.issue} 红球超出范围1-33: {r}")
+    blue = int(d.blue)
+    if blue < 1 or blue > 16:
+        raise ValueError(f"期号 {d.issue} 蓝球超出范围1-16: {blue}")
+    d.reds = reds
+    d.blue = blue
+
+
 def latest_issue(conn: sqlite3.Connection) -> Optional[str]:
     row = conn.execute("SELECT issue FROM draws ORDER BY issue DESC LIMIT 1").fetchone()
     return row["issue"] if row else None
@@ -62,26 +79,30 @@ def latest_issue(conn: sqlite3.Connection) -> Optional[str]:
 
 def upsert_draws(conn: sqlite3.Connection, draws: Iterable[Draw]) -> int:
     now = datetime.utcnow().isoformat()
-    payload = [
-        (
-            d.issue,
-            d.draw_date,
-            d.reds[0],
-            d.reds[1],
-            d.reds[2],
-            d.reds[3],
-            d.reds[4],
-            d.reds[5],
-            d.blue,
-            d.sales,
-            d.pool,
-            d.first_prize_count,
-            d.first_prize_amount,
-            now,
-            now,
+    payload = []
+    for d in draws:
+        _validate_draw(d)
+        payload.append(
+            (
+                d.issue,
+                d.draw_date,
+                d.reds[0],
+                d.reds[1],
+                d.reds[2],
+                d.reds[3],
+                d.reds[4],
+                d.reds[5],
+                d.blue,
+                d.sales,
+                d.pool,
+                d.first_prize_count,
+                d.first_prize_amount,
+                now,
+                now,
+            )
         )
-        for d in draws
-    ]
+    if not payload:
+        return 0
 
     sql = """
     INSERT INTO draws (

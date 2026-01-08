@@ -7,6 +7,7 @@ import torch
 import os
 from pathlib import Path
 from typing import Dict, Tuple
+from .features import build_features
 
 
 def _prepare_dataset(df: pd.DataFrame, window: int = 10):
@@ -17,11 +18,16 @@ def _prepare_dataset(df: pd.DataFrame, window: int = 10):
     """
     cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
     data = df[cols].to_numpy(dtype=int)
+    feats_arr = build_features(df).to_numpy(dtype=float)
     X_list = []
     y_red = {i: [] for i in range(6)}
     y_blue = []
     for i in range(window, len(data)):
         window_slice = data[i - window : i].reshape(-1)
+        # 组合哈希：使用窗口最后一期红球组合，捕捉历史组合模式
+        last_reds = data[i - 1, :6]
+        combo_id = hash(tuple(sorted(int(x) for x in last_reds)))
+        window_slice = np.concatenate([window_slice, np.array([combo_id], dtype=int), feats_arr[i]])
         X_list.append(window_slice)
         for p in range(6):
             y_red[p].append(data[i][p])
@@ -235,6 +241,10 @@ def predict_next(models: dict, df: pd.DataFrame, top_k: int = 3):
     if len(data) < window:
         raise ValueError("样本不足，无法进行预测")
     x = data[-window:].reshape(1, -1)
+    last_reds = data[-1, :6]
+    combo_id = hash(tuple(sorted(int(xx) for xx in last_reds)))
+    feats_arr = build_features(df).to_numpy(dtype=float)
+    x = np.concatenate([x, np.array([[combo_id]], dtype=int), feats_arr[-1:].astype(float)], axis=1)
 
     red_preds = {}
     for p, model in models["red"].items():
