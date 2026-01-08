@@ -1,9 +1,4 @@
-# 双色球爬取与混沌概率分析
-
-一个简单的 Python 工具，用于：
-- 爬取并结构化存储全部历史双色球开奖数据到 SQLite 数据库。
-- 定期比对最新数据（基于系统时间与数据库已有期号），发现新增即抓取入库。
-- 基于现代概率与混沌指标对数据做规律挖掘，输出频率、冷热、近似最大李雅普诺夫指数等指标。
+# 双色球爬取、分析与多模型融合预测（含混沌指标）
 
 ## 快速开始
 1. 安装依赖（建议使用虚拟环境）：
@@ -25,45 +20,65 @@
    streamlit run app.py
    ```
    页面提供一键同步、频率/显著热冷号、遗漏、自相关、统计检验与推荐可视化；分析期数输入 0 表示使用全量数据。
-5. 机器学习预测（CatBoost，位置多分类）：
+5. 预测（多模型+融合+stacking+复式/杀号）：
    ```bash
-   python main.py predict --db data/ssq.db --recent 400 --window 10 --topk 3
+   python main.py predict --db data/ssq.db --recent 400 --window 10 --topk 3 \
+     --bayes-cat --bayes-seq --bayes-tft --bayes-nhits --bayes-timesnet --bayes-prophet \
+     --stack-bayes
    ```
-   可调参数：`--iter`(默认300)、`--depth`(6)、`--lr`(0.1)，输出红球各位置与蓝球的 Top-k 概率。
-6. 序列模型预测（Transformer）：
+   - 可选流式回测：`--seq-backtest/--tft-backtest/--nhits-backtest/--timesnet-backtest`
+   - 输出：基础模型、融合、XGBoost stacking、奇偶预测、和值标准差、约束复式、杀号。
+6. 单模型序列预测：
    ```bash
    python main.py predict-seq --db data/ssq.db --recent 600 --window 20 --epochs 30 --topk 3
-   ```
-   可调参数：`--d-model`(96)、`--nhead`(4)、`--layers`(3)、`--ff`(192)、`--dropout`(0.1)、`--lr`(1e-3)。
-7. TFT 风格序列模型预测：
-   ```bash
    python main.py predict-tft --db data/ssq.db --recent 800 --window 20 --epochs 30 --topk 3
    ```
-   可调参数：`--d-model`(128)、`--nhead`(4)、`--layers`(3)、`--ff`(256)、`--dropout`(0.1)、`--lr`(1e-3)。
-8. CatBoost 位置模型滚动验证：
+7. 滚动验证：
    ```bash
    python main.py cv-cat --db data/ssq.db --recent 800 --train 300 --test 20 --step 20
-   ```
-   输出各折红球位置 Top1 均值与蓝球 Top1 均值，便于评估泛化表现。
-9. TFT 滚动验证：
-   ```bash
    python main.py cv-tft --db data/ssq.db --recent 800 --train 400 --test 40 --step 40
    ```
-   支持可调频率/熵滑窗与模型超参，用于评估时间分段下的稳定性。
-   已加入多任务辅助头（和值回归、奇偶计数、跨度回归），帮助主任务收敛更稳。
-10. 一条命令训练多模型（调度 CatBoost / Transformer / TFT）：
-    ```bash
-    # 默认跑 CatBoost 与 Transformer，TFT 需加 --run-tft，必要时加 --sync
-    python main.py train-all --db data/ssq.db --recent 800 --sync --run-tft --run-nhits --run-prophet --run-timesnet
-    ```
-    可选参数：
-    - CatBoost：`--cat-window 10 --cat-iter 300 --cat-depth 6 --cat-lr 0.1`
-    - Transformer：`--seq-window 20 --seq-epochs 20 --seq-d-model 96 --seq-nhead 4 --seq-layers 3 --seq-ff 192 --seq-dropout 0.1 --seq-lr 1e-3`
-    - TFT：`--run-tft --tft-window 20 --tft-epochs 20 --tft-d-model 128 --tft-nhead 4 --tft-layers 3 --tft-ff 256 --tft-dropout 0.1 --tft-freq-window 50 --tft-entropy-window 50`
-    - N-HiTS（和值+蓝球单变量）：`--run-nhits --nhits-input 60 --nhits-layers 2 --nhits-blocks 1 --nhits-steps 200 --nhits-lr 1e-3`
-    - Prophet（和值+蓝球单变量）：`--run-prophet`
-    - TimesNet（和值+蓝球单变量）：`--run-timesnet --timesnet-input 120 --timesnet-hidden 64 --timesnet-topk 5 --timesnet-steps 300 --timesnet-lr 1e-3 --timesnet-dropout 0.1`
-    - 融合（蓝球/和值/红球位置动态加权）：`--run-blend`（需至少两个基础模型开启，将自动做滚动融合与最新融合预测）
+8. 一键训练/调度：
+   ```bash
+   python main.py train-all --db data/ssq.db --sync --recent 800 \
+     --run-tft --run-nhits --run-prophet --run-timesnet --run-blend
+   ```
+9. UI 快捷：
+   ```bash
+   streamlit run app.py
+   ```
+
+## 功能概览
+- 数据与校验：全量/增量抓取；入库前校验红 6 不重复且 1-33，蓝 1 且 1-16。
+- 分析：频率/热冷、基础统计、卡方/游程、自相关、遗漏/周期、相空间、相关维数、FNN、RR/DET、Apriori。
+- 特征：AC 值、和值尾、跨度、奇偶/质合/大小比、遗漏、农历、周几等。
+- 预测模型（GPU 优先，含 FocalLoss/组合哈希等增强）：
+  - CatBoost 位置；Transformer；TFT（多任务：和值/奇偶/跨度）
+  - N-HiTS / TimesNet / Prophet（和值+蓝球）
+  - 奇偶模型（红球奇数个数）；和值标准差模型（用于约束）
+- 融合/stacking：
+  - 动态加权融合（蓝/红/和值）
+  - XGBoost 元模型（概率向量特征，支持贝叶斯调参）
+- 约束与推荐：
+  - 基于高概率红/蓝 + 和值均值±预测标准差 + 奇偶预测生成复式
+  - 杀号：概率 < 0.01% 的红/蓝
+- 回测：
+  - CatBoost/TFT 滚动验证
+  - Transformer/TFT/N-HiTS/TimesNet 流式回测（IterableDataset）
+
+## 数据源
+- 主：福彩官网 JSON（约 2013~今） `https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice`
+- 辅：500.com 历史页与分年段补齐 2003~2012
+
+## 目录速览
+- `main.py`：CLI、调度、融合/stacking、复式与杀号
+- `lottery/scraper.py`：爬虫
+- `lottery/database.py`：Schema 与入库校验
+- `lottery/analyzer.py`：统计/混沌/Apriori
+- `lottery/ml_model.py` 等：CatBoost/Transformer/TFT/N-HiTS/TimesNet/Prophet
+- `lottery/odd_model.py`：奇偶数预测
+- `lottery/sum_model.py`：和值标准差预测
+- `lottery/blender.py`：融合、stacking、复式、杀号
 
 ## 主要文件
 - `main.py`：命令行入口，包含 `sync` 与 `analyze` 子命令。
