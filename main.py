@@ -1,0 +1,1227 @@
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import numpy as np
+
+from lottery import analyzer, database, scraper, blender
+from lottery import ml_model, seq_model, tft_model, nhits_model, timesnet_model, prophet_model, validation
+
+
+def cmd_sync(args) -> None:
+    db_path = Path(args.db)
+    print(f"[sync] 使用数据库: {db_path}")
+    database.init_db(db_path)
+
+    all_draws = scraper.fetch_all_draws()
+    print(f"[sync] 抓取到 {len(all_draws)} 期历史数据")
+
+    with database.get_conn(db_path) as conn:
+        existing = {row["issue"] for row in conn.execute("SELECT issue FROM draws")}
+        to_insert = scraper.filter_new_draws(all_draws, existing)
+        # 若已有数据为空，则全量写入
+        if not existing:
+            to_insert = all_draws
+
+        if not to_insert:
+            print("[sync] 数据库已是最新，无需更新")
+            return
+
+        affected = database.upsert_draws(conn, to_insert)
+        latest_issue = max(d.issue for d in to_insert)
+        print(f"[sync] 新增/更新 {affected} 期，最新期号 {latest_issue}")
+
+
+def cmd_analyze(args) -> None:
+    db_path = Path(args.db)
+    with database.get_conn(db_path) as conn:
+        df = analyzer.load_dataframe(conn, recent=args.recent)
+
+    if df.empty:
+        print("数据库为空，请先运行 sync 同步数据。")
+        sys.exit(1)
+
+    report = analyzer.analyze(df, entropy_window=args.entropy_window)
+
+    print(f"[analyze] 样本期数: {report['count']}, 最新期号: {report['latest_issue']}")
+    print(f"[analyze] 高频红球: {report['hot_red']}  冷门红球: {report['cold_red']}")
+    print(f"[analyze] 高频蓝球: {report['hot_blue']}  冷门蓝球: {report['cold_blue']}")
+    if report["entropy_recent"] is not None:
+        print(f"[analyze] 近期（窗口 {args.entropy_window}）熵: {report['entropy_recent']:.4f}")
+    if report["lyapunov"] is not None:
+        print(f"[analyze] 近似最大李雅普诺夫指数: {report['lyapunov']:.4f} (越大越具混沌)")
+    stats = report.get("basic_stats", {})
+    if stats:
+        print(
+            f"[analyze] 基础统计: 红均值 {stats['red_mean']:.2f}±{stats['red_std']:.2f}, "
+            f"蓝均值 {stats['blue_mean']:.2f}±{stats['blue_std']:.2f}, "
+            f"和值均值 {stats['sum_mean']:.2f}±{stats['sum_std']:.2f}"
+        )
+    chi = report.get("chi_square", {})
+    if chi:
+        print(f"[analyze] 卡方检验(红): stat={chi['red']['stat']:.2f}, dof={chi['red']['dof']} (均匀性偏离越大stat越大)")
+        print(f"[analyze] 卡方检验(蓝): stat={chi['blue']['stat']:.2f}, dof={chi['blue']['dof']}")
+    runs = report.get("runs_test_sum")
+    if runs:
+        print(f"[analyze] 游程检验(和值序列): runs={runs['runs']}, z={runs['z']:.3f}, p≈{runs['p']:.3f} (p小于0.05则拒绝独立同分布假设)")
+    corr_dim = report.get("corr_dimension")
+    if corr_dim is not None:
+        print(f"[analyze] 相关维(简化GP): {corr_dim:.3f}")
+    fnn = report.get("fnn", {})
+    if fnn:
+        msg = ", ".join(f"m={m}: {v:.2%}" for m, v in sorted(fnn.items()))
+        print(f"[analyze] 虚假最近邻比例: {msg} (越低越能说明嵌入维度充分)")
+    sig = report.get("significant", {})
+    if sig:
+        red_hot = sig.get("red", {}).get("hot", [])
+        red_cold = sig.get("red", {}).get("cold", [])
+        blue_hot = sig.get("blue", {}).get("hot", [])
+        blue_cold = sig.get("blue", {}).get("cold", [])
+        if red_hot or red_cold:
+            print(f"[analyze] 显著热红号(z>=2): {red_hot}  显著冷红号(z<=-2): {red_cold}")
+        if blue_hot or blue_cold:
+            print(f"[analyze] 显著热蓝号(z>=2): {blue_hot}  显著冷蓝号(z<=-2): {blue_cold}")
+    ac = report.get("autocorr", {})
+    if ac:
+        show_lags = [lag for lag in sorted(ac.keys()) if lag <= 5]
+        vals = ", ".join(f"lag{l}={ac[l]:.3f}" for l in show_lags)
+        print(f"[analyze] 和值序列自相关: {vals}")
+    omission = report.get("omission", {})
+    if omission:
+        red_om = omission.get("red", {})
+        blue_om = omission.get("blue", {})
+        red_sorted = sorted(red_om.items(), key=lambda kv: kv[1]["current"], reverse=True)[:3]
+        blue_sorted = sorted(blue_om.items(), key=lambda kv: kv[1]["current"], reverse=True)[:3]
+        red_msg = ", ".join(f"{n}(当前{v['current']}, 历史Max{v['max']})" for n, v in red_sorted)
+        blue_msg = ", ".join(f"{n}(当前{v['current']}, 历史Max{v['max']})" for n, v in blue_sorted)
+        print(f"[analyze] 红球遗漏Top3: {red_msg}")
+        print(f"[analyze] 蓝球遗漏Top3: {blue_msg}")
+    periodic = report.get("periodic", {})
+    if periodic:
+        red_all = periodic.get("red", {}).get("all", [])
+        blue_all = periodic.get("blue", {}).get("all", [])
+        red_p = periodic.get("red", {}).get("periodic", [])[:3]
+        blue_p = periodic.get("blue", {}).get("periodic", [])[:3]
+        if red_p:
+            msg = ", ".join(f"{x['num']}(均间隔{round(x['mean_gap'],1)}±{round(x['std_gap'],1)}, CV={x['cv']:.2f})" for x in red_p)
+            print(f"[analyze] 可疑准时出现的红号: {msg}")
+        if blue_p:
+            msg = ", ".join(f"{x['num']}(均间隔{round(x['mean_gap'],1)}±{round(x['std_gap'],1)}, CV={x['cv']:.2f})" for x in blue_p)
+            print(f"[analyze] 可疑准时出现的蓝号: {msg}")
+        if red_all:
+            top = red_all[:5]
+            msg = "; ".join(f"{x['num']}:均{round(x['mean_gap'],1)}±{round(x['std_gap'],1)},CV={x['cv']:.2f},min={x['min_gap']},max={x['max_gap']}" for x in top)
+            print(f"[analyze] 红球间隔统计CV最小Top5: {msg}")
+        if blue_all:
+            top = blue_all[:5]
+            msg = "; ".join(f"{x['num']}:均{round(x['mean_gap'],1)}±{round(x['std_gap'],1)},CV={x['cv']:.2f},min={x['min_gap']},max={x['max_gap']}" for x in top)
+            print(f"[analyze] 蓝球间隔统计CV最小Top5: {msg}")
+    chaos = report.get("chaos", {})
+    if chaos:
+        if chaos.get("corr_dim"):
+            cd = chaos["corr_dim"]
+            msg = "; ".join(f"m{m}:{cd[m]:.2f}" for m in sorted(cd.keys()))
+            print(f"[analyze] 相关维数估计: {msg}")
+        if chaos.get("fnn"):
+            fnn = chaos["fnn"]
+            msg = "; ".join(f"m{m}->{m+1}:{fnn[m]:.1f}%" for m in sorted(fnn.keys()))
+            print(f"[analyze] 假最近邻比例: {msg}")
+        if chaos.get("recur"):
+            r = chaos["recur"]
+            print(f"[analyze] 复现率RR={r.get('rr', float('nan')):.4f}, DET={r.get('det', float('nan')):.4f} (eps={r.get('eps', float('nan')):.4f})")
+    rules = report.get("rules", [])
+    if rules:
+        top_rules = rules[:5]
+        formatted = "; ".join(
+            f"{r['antecedent']} -> {r['consequent']} (sup={r['support']:.3f}, conf={r['confidence']:.2f}, lift={r['lift']:.2f})"
+            for r in top_rules
+        )
+        print(f"[analyze] Apriori 关联规则Top5: {formatted}")
+    else:
+        print("[analyze] Apriori 关联规则: 暂无满足阈值的规则 (默认 sup>=0.01, conf>=0.2)")
+    suggestion = report["suggestion"]
+    print(f"[analyze] 基于频率与混沌检验的推荐组合: 红 {suggestion['reds']} + 蓝 {suggestion['blue']}")
+
+
+def cmd_predict(args) -> None:
+    db_path = Path(args.db)
+    with database.get_conn(db_path) as conn:
+        df = analyzer.load_dataframe(conn, recent=args.recent)
+    if df.empty or len(df) < args.window + 1:
+        print("样本不足，无法训练预测模型。")
+        sys.exit(1)
+    print(f"[predict][blend] 使用最近 {len(df)} 期数据，窗口 {args.window}，CatBoost 迭代 {args.iter}")
+
+    base_predictors = []
+
+    # CatBoost 基础模型（可选贝叶斯调参）
+    cat_iter = args.iter
+    cat_depth = args.depth
+    cat_lr = args.lr
+    if getattr(args, "bayes_cat", False):
+        try:
+            best_est, best_params, best_score = ml_model.bayes_optimize_catboost(
+                df, window=args.window, n_iter=args.bayes_cat_calls, cv_splits=args.bayes_cat_cv, save_dir="models"
+            )
+            cat_depth = int(best_params.get("depth", cat_depth))
+            cat_lr = float(best_params.get("learning_rate", cat_lr))
+            cat_iter = int(best_params.get("iterations", cat_iter))
+            print(f"[bayes-cat] 最优参数: depth={cat_depth}, lr={cat_lr:.4f}, iter={cat_iter}, score={best_score:.4f}")
+        except Exception as e:
+            print(f"[bayes-cat][warn] 调参失败，回退手动参数: {e}")
+    resume = not args.cat_no_resume
+    fresh = args.cat_fresh
+    cat_models = ml_model.train_models(
+        df,
+        window=args.window,
+        iterations=cat_iter,
+        depth=cat_depth,
+        learning_rate=cat_lr,
+        save_dir="models",
+        resume=resume,
+        fresh=fresh,
+    )
+    cat_preds = ml_model.predict_next(cat_models, df, top_k=args.topk)
+    for pos, items in cat_preds["red"].items():
+        print(f"[predict][catboost] 位置{pos} Top{args.topk}: " + ", ".join([f"{n}({p:.3f})" for n, p in items]))
+    print(f"[predict][catboost] 蓝球 Top{args.topk}: " + ", ".join([f"{n}({p:.3f})" for n, p in cat_preds['blue']]))
+
+    def pred_cat(hist_df):
+        return ml_model.predict_next(cat_models, hist_df, top_k=1)
+
+    base_predictors.append(pred_cat)
+
+    # 频率基线（不训练）
+    def pred_freq(hist_df):
+        cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
+        data = hist_df[cols].to_numpy(dtype=int)
+        reds = data[:, :6].ravel()
+        blues = data[:, 6]
+        red_freq = np.bincount(reds, minlength=34)
+        blue_freq = np.bincount(blues, minlength=17)
+        red_top = np.argsort(red_freq[1:])[::-1][:6] + 1
+        blue_top = np.argsort(blue_freq[1:])[::-1][:1] + 1
+        red_preds = {i + 1: [(int(n), 1.0 / len(red_top))] for i, n in enumerate(red_top[:6])}
+        blue_preds = [(int(blue_top[0]), 1.0)]
+        return {"red": red_preds, "blue": blue_preds, "sum_pred": float(data[-1, :].sum())}
+
+    base_predictors.append(pred_freq)
+
+    # Transformer
+    try:
+        # 默认超参
+        seq_window = args.window
+        seq_bs = 64
+        seq_epochs = 10
+        seq_lr = 5e-4
+        seq_dm = 96
+        seq_nh = 4
+        seq_layers = 3
+        seq_ff = 192
+        seq_dr = 0.1
+        # 可选贝叶斯调参
+        if getattr(args, "bayes_seq", False):
+            try:
+                best_params, best_loss = seq_model.bayes_optimize_seq(
+                    df, recent=max(200, args.recent or 0), n_iter=args.bayes_seq_calls
+                )
+                seq_window = int(best_params["window"])
+                seq_bs = int(best_params["batch_size"])
+                seq_lr = float(best_params["lr"])
+                seq_dm = int(best_params["d_model"])
+                seq_nh = int(best_params["nhead"])
+                seq_layers = int(best_params["num_layers"])
+                seq_ff = int(best_params["ff"])
+                seq_dr = float(best_params["dropout"])
+                print(f"[bayes-seq] 最优参数: {best_params}, loss={best_loss:.4f}")
+            except Exception as e:
+                print(f"[bayes-seq][warn] 调参失败，回退默认: {e}")
+        seq_cfg = seq_model.TrainConfig(
+            window=seq_window,
+            batch_size=seq_bs,
+            epochs=seq_epochs,
+            lr=seq_lr,
+            d_model=seq_dm,
+            nhead=seq_nh,
+            num_layers=seq_layers,
+            ff=seq_ff,
+            dropout=seq_dr,
+            topk=1,
+        )
+        seq_resume = not getattr(args, "seq_no_resume", False)
+        seq_fresh = getattr(args, "seq_fresh", False)
+        seq_m, seq_cfg = seq_model.train_seq_model(
+            df.tail(max(800, seq_window + 5)),
+            seq_cfg,
+            save_dir="models",
+            resume=seq_resume,
+            fresh=seq_fresh,
+        )
+
+        def pred_seq(hist_df):
+            return seq_model.predict_seq(seq_m, seq_cfg, hist_df)
+
+        base_predictors.append(pred_seq)
+        print("[predict][seq] 已加入融合")
+    except Exception as e:
+        print(f"[predict][seq][warn] 跳过: {e}")
+
+    # TFT
+    try:
+        tft_window = args.window
+        tft_bs = 64
+        tft_epochs = 10
+        tft_lr = 5e-4
+        tft_dm = 128
+        tft_nh = 4
+        tft_layers = 3
+        tft_ff = 256
+        tft_dr = 0.1
+        tft_fw = 50
+        tft_ew = 50
+        if getattr(args, "bayes_tft", False):
+            try:
+                best_params, best_loss = tft_model.bayes_optimize_tft(
+                    df, recent=max(args.bayes_tft_recent, args.recent or 0), n_iter=args.bayes_tft_calls
+                )
+                tft_window = int(best_params["window"])
+                tft_bs = int(best_params["batch"])
+                tft_lr = float(best_params["lr"])
+                tft_dm = int(best_params["d_model"])
+                tft_nh = int(best_params["nhead"])
+                tft_layers = int(best_params["layers"])
+                tft_ff = int(best_params["ff"])
+                tft_dr = float(best_params["dropout"])
+                print(f"[bayes-tft] 最优参数: {best_params}, loss={best_loss:.4f}")
+            except Exception as e:
+                print(f"[bayes-tft][warn] 调参失败，回退默认: {e}")
+        tft_cfg = tft_model.TFTConfig(
+            window=tft_window,
+            batch=tft_bs,
+            epochs=tft_epochs,
+            lr=tft_lr,
+            d_model=tft_dm,
+            nhead=tft_nh,
+            layers=tft_layers,
+            ff=tft_ff,
+            dropout=tft_dr,
+            topk=1,
+            freq_window=tft_fw,
+            entropy_window=tft_ew,
+        )
+        tft_resume = not getattr(args, "tft_no_resume", False)
+        tft_fresh = getattr(args, "tft_fresh", False)
+        tft_m, tft_cfg = tft_model.train_tft(
+            df.tail(max(800, tft_window + 5)),
+            tft_cfg,
+            save_dir="models",
+            resume=tft_resume,
+            fresh=tft_fresh,
+        )
+
+        def pred_tft(hist_df):
+            return tft_model.predict_tft(tft_m, tft_cfg, hist_df)
+
+        base_predictors.append(pred_tft)
+        print("[predict][tft] 已加入融合")
+    except Exception as e:
+        print(f"[predict][tft][warn] 跳过: {e}")
+
+    # N-HiTS（和值/蓝球）
+    try:
+        nh_input = min(90, len(df) // 2)
+        nh_lr = 5e-4
+        nh_ms = 80
+        nh_bs = 32
+        if getattr(args, "bayes_nhits", False):
+            try:
+                best_params, best_loss = nhits_model.bayes_optimize_nhits(
+                    df, recent=args.bayes_nhits_recent, n_iter=args.bayes_nhits_calls
+                )
+                nh_input = int(best_params["input_size"])
+                nh_lr = float(best_params["learning_rate"])
+                nh_ms = int(best_params["max_steps"])
+                nh_bs = int(best_params["batch_size"])
+                print(f"[bayes-nhits] 最优参数: {best_params}, loss={best_loss:.4f}")
+            except Exception as e:
+                print(f"[bayes-nhits][warn] 调参失败，回退默认: {e}")
+        nh_cfg = nhits_model.NHitsConfig(
+            input_size=nh_input,
+            h=1,
+            learning_rate=nh_lr,
+            max_steps=nh_ms,
+            batch_size=nh_bs,
+            valid_size=0.1,
+            early_stop_patience_steps=5,
+        )
+        nh_resume = not getattr(args, "nhits_no_resume", False)
+        nh_fresh = getattr(args, "nhits_fresh", False)
+        nh_m, nh_cfg = nhits_model.train_nhits(df, nh_cfg, save_dir="models", resume=nh_resume, fresh=nh_fresh)
+
+        def pred_nh(hist_df):
+            return nhits_model.predict_nhits(nh_m, nh_cfg, hist_df)
+
+        base_predictors.append(pred_nh)
+        print("[predict][nhits] 已加入融合")
+    except Exception as e:
+        print(f"[predict][nhits][warn] 跳过: {e}")
+
+    # TimesNet（和值/蓝球）
+    try:
+        tn_input = min(150, len(df) // 2)
+        tn_lr = 5e-4
+        tn_ms = 100
+        tn_bs = 32
+        tn_hidden = 64
+        tn_topk = 5
+        tn_dr = 0.1
+        if getattr(args, "bayes_timesnet", False):
+            try:
+                best_params, best_loss = timesnet_model.bayes_optimize_timesnet(
+                    df, recent=args.bayes_timesnet_recent, n_iter=args.bayes_timesnet_calls
+                )
+                tn_input = int(best_params["input_size"])
+                tn_hidden = int(best_params["hidden_size"])
+                tn_topk = int(best_params["top_k"])
+                tn_dr = float(best_params["dropout"])
+                tn_lr = float(best_params["learning_rate"])
+                tn_ms = int(best_params["max_steps"])
+                tn_bs = int(best_params["batch_size"])
+                print(f"[bayes-timesnet] 最优参数: {best_params}, loss={best_loss:.4f}")
+            except Exception as e:
+                print(f"[bayes-timesnet][warn] 调参失败，回退默认: {e}")
+        tn_cfg = timesnet_model.TimesNetConfig(
+            input_size=tn_input,
+            h=1,
+            hidden_size=tn_hidden,
+            top_k=tn_topk,
+            dropout=tn_dr,
+            learning_rate=tn_lr,
+            max_steps=tn_ms,
+            batch_size=tn_bs,
+            valid_size=0.1,
+        )
+        tn_resume = not getattr(args, "timesnet_no_resume", False)
+        tn_fresh = getattr(args, "timesnet_fresh", False)
+        tn_m, tn_cfg = timesnet_model.train_timesnet(df, tn_cfg, save_dir="models", resume=tn_resume, fresh=tn_fresh)
+
+        def pred_tn(hist_df):
+            return timesnet_model.predict_timesnet(tn_m, hist_df)
+
+        base_predictors.append(pred_tn)
+        print("[predict][timesnet] 已加入融合")
+    except Exception as e:
+        print(f"[predict][timesnet][warn] 跳过: {e}")
+
+    # Prophet（和值/蓝球）
+    try:
+        pr_cfg = prophet_model.ProphetConfig()
+        if getattr(args, "bayes_prophet", False):
+            try:
+                best_params, best_mae = prophet_model.bayes_optimize_prophet(
+                    df, recent=args.bayes_prophet_recent, n_iter=args.bayes_prophet_calls
+                )
+                pr_cfg.changepoint_prior_scale = best_params["changepoint_prior_scale"]
+                pr_cfg.seasonality_prior_scale = best_params["seasonality_prior_scale"]
+                print(f"[bayes-prophet] 最优参数: {best_params}, mae={best_mae:.4f}")
+            except Exception as e:
+                print(f"[bayes-prophet][warn] 调参失败，回退默认: {e}")
+        pr_resume = not getattr(args, "prophet_no_resume", False)
+        pr_fresh = getattr(args, "prophet_fresh", False)
+        pr_m, pr_cfg = prophet_model.train_prophet(df, pr_cfg, save_dir="models", resume=pr_resume, fresh=pr_fresh)
+
+        def pred_pr(hist_df):
+            return prophet_model.predict_prophet(pr_m, hist_df)
+
+        base_predictors.append(pred_pr)
+        print("[predict][prophet] 已加入融合")
+    except Exception as e:
+        print(f"[predict][prophet][warn] 跳过: {e}")
+
+    if len(base_predictors) < 2:
+        print("[predict][blend] 基础模型不足2个，跳过融合")
+        return
+
+    print(f"[predict][blend] 启用基础模型数: {len(base_predictors)}，开始融合...")
+    fused_blue_num, fused_blue_prob = blender.blend_blue_latest(df, base_predictors)
+    fused_sum = blender.blend_sum_latest(df, base_predictors)
+    fused_red = blender.blend_red_latest(df, base_predictors)
+    print(f"[predict][blend] 融合蓝球 Top1: {fused_blue_num} (prob={fused_blue_prob:.3f})")
+    print(f"[predict][blend] 融合和值预测≈{fused_sum:.2f}")
+    print(f"[predict][blend] 融合红球预测: {fused_red}")
+
+
+def cmd_predict_seq(args) -> None:
+    db_path = Path(args.db)
+    with database.get_conn(db_path) as conn:
+        df = analyzer.load_dataframe(conn, recent=args.recent)
+    if df.empty or len(df) < args.window + 1:
+        print("样本不足，无法训练序列模型。")
+        sys.exit(1)
+    # 可选贝叶斯调参
+    if getattr(args, "bayes_seq", False):
+        try:
+            best_params, best_loss = seq_model.bayes_optimize_seq(
+                df, recent=max(200, args.recent or 0), n_iter=args.bayes_seq_calls
+            )
+            args.window = int(best_params["window"])
+            args.batch = int(best_params["batch_size"])
+            args.lr = float(best_params["lr"])
+            args.d_model = int(best_params["d_model"])
+            args.nhead = int(best_params["nhead"])
+            args.layers = int(best_params["num_layers"])
+            args.ff = int(best_params["ff"])
+            args.dropout = float(best_params["dropout"])
+            print(f"[bayes-seq] 最优参数: {best_params}, loss={best_loss:.4f}")
+        except Exception as e:
+            print(f"[bayes-seq][warn] 调参失败，回退命令行参数: {e}")
+    cfg = seq_model.TrainConfig(
+        window=args.window,
+        batch_size=args.batch,
+        epochs=args.epochs,
+        lr=args.lr,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_layers=args.layers,
+        ff=args.ff,
+        dropout=args.dropout,
+        topk=args.topk,
+    )
+    seq_resume = not getattr(args, "seq_no_resume", False)
+    seq_fresh = getattr(args, "seq_fresh", False)
+    model, cfg = seq_model.train_seq_model(df, cfg, save_dir="models", resume=seq_resume, fresh=seq_fresh)
+    preds = seq_model.predict_seq(model, cfg, df)
+    print(f"[predict-seq] 使用最近 {len(df)} 期训练，窗口 {cfg.window}，epochs {cfg.epochs}")
+    for pos, items in preds["red"].items():
+        print(f"[predict-seq] 位置{pos} Top{cfg.topk}: " + ", ".join([f"{n}({p:.3f})" for n, p in items]))
+    print(f"[predict-seq] 蓝球 Top{cfg.topk}: " + ", ".join([f"{n}({p:.3f})" for n, p in preds['blue']]))
+
+
+def cmd_predict_tft(args) -> None:
+    db_path = Path(args.db)
+    with database.get_conn(db_path) as conn:
+        df = analyzer.load_dataframe(conn, recent=args.recent)
+    if df.empty or len(df) < args.window + 1:
+        print("样本不足，无法训练 TFT 序列模型。")
+        sys.exit(1)
+    cfg = tft_model.TFTConfig(
+        window=args.window,
+        batch=args.batch,
+        epochs=args.epochs,
+        lr=args.lr,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        layers=args.layers,
+        ff=args.ff,
+        dropout=args.dropout,
+        topk=args.topk,
+    )
+    tft_resume = not getattr(args, "tft_no_resume", False)
+    tft_fresh = getattr(args, "tft_fresh", False)
+    model, cfg = tft_model.train_tft(df, cfg, save_dir="models", resume=tft_resume, fresh=tft_fresh)
+    preds = tft_model.predict_tft(model, cfg, df)
+    print(f"[predict-tft] 使用最近 {len(df)} 期训练，窗口 {cfg.window}，epochs {cfg.epochs}")
+    for pos, items in preds["red"].items():
+        print(f"[predict-tft] 位置{pos} Top{cfg.topk}: " + ", ".join([f"{n}({p:.3f})" for n, p in items]))
+    print(f"[predict-tft] 蓝球 Top{cfg.topk}: " + ", ".join([f"{n}({p:.3f})" for n, p in preds['blue']]))
+
+
+def cmd_tune_cat(args) -> None:
+    db_path = Path(args.db)
+    with database.get_conn(db_path) as conn:
+        df = analyzer.load_dataframe(conn, recent=args.recent)
+    if df.empty or len(df) < args.window + 1:
+        print("样本不足，无法进行贝叶斯调参。")
+        sys.exit(1)
+    print(f"[tune-cat] 使用最近 {len(df)} 期数据，窗口 {args.window}，迭代 {args.n_iter} 次，cv={args.cv}")
+    try:
+        best_model, best_params, best_score = ml_model.bayes_optimize_catboost(
+            df,
+            window=args.window,
+            n_iter=args.n_iter,
+            cv_splits=args.cv,
+            save_dir="models",
+        )
+    except Exception as e:
+        print(f"[tune-cat][error] {e}")
+        sys.exit(1)
+    print(f"[tune-cat] 最优参数: {best_params}")
+    print(f"[tune-cat] 最优评分(neg_log_loss): {best_score:.4f}")
+    preds = ml_model.predict_next({"red": {}, "blue": best_model, "window": args.window}, df, top_k=args.topk)
+    print(f"[tune-cat] 蓝球 Top{args.topk}: " + ", ".join([f"{n}({p:.3f})" for n, p in preds['blue']]))
+
+
+
+
+def cmd_cv_cat(args) -> None:
+    db_path = Path(args.db)
+    with database.get_conn(db_path) as conn:
+        df = analyzer.load_dataframe(conn, recent=args.recent)
+    if len(df) < args.train + args.test:
+        print("样本不足，无法滚动验证。")
+        sys.exit(1)
+
+    def trainer(train_df: pd.DataFrame):
+        return ml_model.train_models(
+            train_df,
+            window=args.window,
+            iterations=args.iter,
+            depth=args.depth,
+            learning_rate=args.lr,
+        )
+
+    def predictor(model, hist_df: pd.DataFrame):
+        return ml_model.predict_next(model, hist_df, top_k=1)
+
+    results = validation.rolling_cv(
+        df,
+        trainer=trainer,
+        predictor=predictor,
+        train_size=args.train,
+        test_size=args.test,
+        step=args.step,
+    )
+    if not results:
+        print("未得到有效折次。")
+        return
+    red_avg = sum(r.red_hit for r in results) / len(results)
+    blue_avg = sum(r.blue_hit for r in results) / len(results)
+    print(f"[cv-cat] 折数 {len(results)}, 红位置Top1均值 {red_avg:.3f}, 蓝Top1均值 {blue_avg:.3f}")
+    for r in results:
+        print(f"[cv-cat] fold{r.fold}: red={r.red_hit:.3f}, blue={r.blue_hit:.3f}, train_end={r.train_end}, test_end={r.test_end}")
+
+
+def cmd_cv_tft(args) -> None:
+    db_path = Path(args.db)
+    with database.get_conn(db_path) as conn:
+        df = analyzer.load_dataframe(conn, recent=args.recent)
+    if len(df) < args.train + args.test:
+        print("样本不足，无法滚动验证。")
+        sys.exit(1)
+
+    def trainer(train_df: pd.DataFrame):
+        cfg = tft_model.TFTConfig(
+            window=args.window,
+            batch=args.batch,
+            epochs=args.epochs,
+            lr=args.lr,
+            d_model=args.d_model,
+            nhead=args.nhead,
+            layers=args.layers,
+            ff=args.ff,
+            dropout=args.dropout,
+            topk=1,
+            freq_window=args.freq_window,
+            entropy_window=args.entropy_window,
+        )
+        model, _ = tft_model.train_tft(train_df, cfg)
+        return (model, cfg)
+
+    def predictor(model_cfg, hist_df: pd.DataFrame):
+        model, cfg = model_cfg
+        return tft_model.predict_tft(model, cfg, hist_df)
+
+    results = validation.rolling_cv_generic(
+        df,
+        trainer=trainer,
+        predictor=predictor,
+        train_size=args.train,
+        test_size=args.test,
+        step=args.step,
+    )
+    if not results:
+        print("未得到有效折次。")
+        return
+    red_avg = sum(r.red_hit for r in results) / len(results)
+    blue_avg = sum(r.blue_hit for r in results) / len(results)
+    print(f"[cv-tft] 折数 {len(results)}, 红位置Top1均值 {red_avg:.3f}, 蓝Top1均值 {blue_avg:.3f}")
+    for r in results:
+        print(f"[cv-tft] fold{r.fold}: red={r.red_hit:.3f}, blue={r.blue_hit:.3f}, train_end={r.train_end}, test_end={r.test_end}")
+
+
+def _sync_if_needed(db_path: Path, do_sync: bool) -> None:
+    if not do_sync:
+        return
+    print("[train-all] 同步数据中...")
+    database.init_db(db_path)
+    all_draws = scraper.fetch_all_draws()
+    with database.get_conn(db_path) as conn:
+        existing = {row["issue"] for row in conn.execute("SELECT issue FROM draws")}
+        to_insert = scraper.filter_new_draws(all_draws, existing)
+        if not existing:
+            to_insert = all_draws
+        if to_insert:
+            affected = database.upsert_draws(conn, to_insert)
+            latest_issue = max(d.issue for d in to_insert)
+            print(f"[train-all] 同步完成，新入库 {affected} 期，最新期号 {latest_issue}")
+        else:
+            print("[train-all] 数据库已最新，无需更新")
+
+
+def cmd_train_all(args) -> None:
+    db_path = Path(args.db)
+    _sync_if_needed(db_path, args.sync)
+    with database.get_conn(db_path) as conn:
+        df = analyzer.load_dataframe(conn, recent=args.recent)
+    if df.empty:
+        print("数据库为空，请先同步数据。")
+        sys.exit(1)
+
+    print(f"[train-all] 使用最近 {len(df)} 期样本")
+
+    # CatBoost
+    if not args.no_cat:
+        if len(df) < args.cat_window + 1:
+            print("[train-all][CatBoost] 样本不足，跳过")
+        else:
+            print("[train-all][CatBoost] 训练中...")
+            cat_iter = args.cat_iter
+            cat_depth = args.cat_depth
+            cat_lr = args.cat_lr
+            if args.bayes_cat:
+                try:
+                    _, best_params, best_score = ml_model.bayes_optimize_catboost(
+                        df, window=args.cat_window, n_iter=args.bayes_cat_calls, cv_splits=args.bayes_cat_cv, save_dir="models"
+                    )
+                    cat_depth = int(best_params.get("depth", cat_depth))
+                    cat_lr = float(best_params.get("learning_rate", cat_lr))
+                    cat_iter = int(best_params.get("iterations", cat_iter))
+                    print(f"[train-all][bayes-cat] 最优: depth={cat_depth}, lr={cat_lr:.4f}, iter={cat_iter}, score={best_score:.4f}")
+                except Exception as e:
+                    print(f"[train-all][bayes-cat][warn] 调参失败，沿用手动参数: {e}")
+            cat_resume = not args.cat_no_resume
+            cat_fresh = args.cat_fresh
+            models = ml_model.train_models(
+                df,
+                window=args.cat_window,
+                iterations=cat_iter,
+                depth=cat_depth,
+                learning_rate=cat_lr,
+                save_dir="models",
+                resume=cat_resume,
+                fresh=cat_fresh,
+            )
+            preds = ml_model.predict_next(models, df, top_k=3)
+            print("[train-all][CatBoost] 训练完成，最新窗口预测：")
+            for pos, items in preds["red"].items():
+                print(f"  位置{pos} Top3: " + ", ".join([f"{n}({p:.3f})" for n, p in items]))
+            print("  蓝球 Top3: " + ", ".join([f"{n}({p:.3f})" for n, p in preds["blue"]]))
+
+    # Transformer 序列
+    if not args.no_seq:
+        if len(df) < args.seq_window + 1:
+            print("[train-all][Transformer] 样本不足，跳过")
+        else:
+            print("[train-all][Transformer] 训练中...")
+            seq_window = args.seq_window
+            seq_bs = 64
+            seq_epochs = args.seq_epochs
+            seq_lr = args.seq_lr
+            seq_dm = args.seq_d_model
+            seq_nh = args.seq_nhead
+            seq_layers = args.seq_layers
+            seq_ff = args.seq_ff
+            seq_dr = args.seq_dropout
+            if args.bayes_seq:
+                try:
+                    best_params, best_loss = seq_model.bayes_optimize_seq(
+                        df, recent=args.bayes_seq_recent, n_iter=args.bayes_seq_calls
+                    )
+                    seq_window = int(best_params["window"])
+                    seq_bs = int(best_params["batch_size"])
+                    seq_lr = float(best_params["lr"])
+                    seq_dm = int(best_params["d_model"])
+                    seq_nh = int(best_params["nhead"])
+                    seq_layers = int(best_params["num_layers"])
+                    seq_ff = int(best_params["ff"])
+                    seq_dr = float(best_params["dropout"])
+                    print(f"[train-all][bayes-seq] 最优: {best_params}, loss={best_loss:.4f}")
+                except Exception as e:
+                    print(f"[train-all][bayes-seq][warn] 调参失败，沿用手动参数: {e}")
+            cfg = seq_model.TrainConfig(
+                window=seq_window,
+                batch_size=seq_bs,
+                epochs=seq_epochs,
+                lr=seq_lr,
+                d_model=seq_dm,
+                nhead=seq_nh,
+                num_layers=seq_layers,
+                ff=seq_ff,
+                dropout=seq_dr,
+                topk=3,
+            )
+            seq_resume = not args.seq_no_resume
+            seq_fresh = args.seq_fresh
+            model, cfg = seq_model.train_seq_model(df, cfg, save_dir="models", resume=seq_resume, fresh=seq_fresh)
+            preds = seq_model.predict_seq(model, cfg, df)
+            print("[train-all][Transformer] 训练完成，最新窗口预测：")
+            for pos, items in preds["red"].items():
+                print(f"  位置{pos} Top3: " + ", ".join([f"{n}({p:.3f})" for n, p in items]))
+            print("  蓝球 Top3: " + ", ".join([f"{n}({p:.3f})" for n, p in preds['blue']]))
+
+    # TFT
+    if args.run_tft:
+        if len(df) < args.tft_window + 1:
+            print("[train-all][TFT] 样本不足，跳过")
+        else:
+            print("[train-all][TFT] 训练中...（若无 GPU 将较耗时）")
+            cfg = tft_model.TFTConfig(
+                window=args.tft_window,
+                batch=args.tft_batch,
+                epochs=args.tft_epochs,
+                lr=args.tft_lr,
+                d_model=args.tft_d_model,
+                nhead=args.tft_nhead,
+                layers=args.tft_layers,
+                ff=args.tft_ff,
+                dropout=args.tft_dropout,
+                topk=3,
+                freq_window=args.tft_freq_window,
+                entropy_window=args.tft_entropy_window,
+            )
+            tft_resume = not args.tft_no_resume
+            tft_fresh = args.tft_fresh
+            model, cfg = tft_model.train_tft(df, cfg, save_dir="models", resume=tft_resume, fresh=tft_fresh)
+            preds = tft_model.predict_tft(model, cfg, df)
+            print("[train-all][TFT] 训练完成，最新窗口预测：")
+            for pos, items in preds["red"].items():
+                print(f"  位置{pos} Top3: " + ", ".join([f"{n}({p:.3f})" for n, p in items]))
+            print("  蓝球 Top3: " + ", ".join([f"{n}({p:.3f})" for n, p in preds['blue']]))
+
+    # N-HiTS（和值+蓝球单变量通道）
+    if args.run_nhits:
+        if len(df) < args.nhits_input + 1:
+            print("[train-all][N-HiTS] 样本不足，跳过")
+        else:
+            print("[train-all][N-HiTS] 训练中...")
+            cfg = nhits_model.NHitsConfig(
+                input_size=args.nhits_input,
+                h=1,
+                n_layers=args.nhits_layers,
+                n_blocks=args.nhits_blocks,
+                n_harmonics=2,
+                n_polynomials=1,
+                dropout=0.1,
+                learning_rate=args.nhits_lr,
+                max_steps=args.nhits_steps,
+                batch_size=32,
+                valid_size=0.1,
+                topk=3,
+            )
+            nh_resume = not getattr(args, "nhits_no_resume", False)
+            nh_fresh = getattr(args, "nhits_fresh", False)
+            nf, cfg = nhits_model.train_nhits(df, cfg, save_dir="models", resume=nh_resume, fresh=nh_fresh)
+            preds = nhits_model.predict_nhits(nf, cfg, df)
+            print(f"[train-all][N-HiTS] 训练完成，和值预测≈{preds['sum_pred']:.2f}，蓝球预测≈{preds['blue_pred']:.2f}")
+
+    # Prophet（和值/蓝球单变量）
+    if args.run_prophet:
+        if len(df) < 20:
+            print("[train-all][Prophet] 样本不足，跳过")
+        else:
+            print("[train-all][Prophet] 训练中...")
+            cfg = prophet_model.ProphetConfig()
+            pr_resume = not getattr(args, "prophet_no_resume", False)
+            pr_fresh = getattr(args, "prophet_fresh", False)
+            models, cfg = prophet_model.train_prophet(df, cfg, save_dir="models", resume=pr_resume, fresh=pr_fresh)
+            preds = prophet_model.predict_prophet(models, df)
+            print(f"[train-all][Prophet] 训练完成，和值预测≈{preds['sum']:.2f}，蓝球预测≈{preds['blue']:.2f}")
+
+    # TimesNet（和值+蓝球单变量通道，基于 NeuralForecast）
+    if args.run_timesnet:
+        if len(df) < args.timesnet_input + 1:
+            print("[train-all][TimesNet] 样本不足，跳过")
+        else:
+            print("[train-all][TimesNet] 训练中...")
+            cfg = timesnet_model.TimesNetConfig(
+                input_size=args.timesnet_input,
+                h=1,
+                hidden_size=args.timesnet_hidden,
+                top_k=args.timesnet_topk,
+                dropout=args.timesnet_dropout,
+                learning_rate=args.timesnet_lr,
+                max_steps=args.timesnet_steps,
+                batch_size=32,
+                valid_size=0.1,
+            )
+            tn_resume = not getattr(args, "timesnet_no_resume", False)
+            tn_fresh = getattr(args, "timesnet_fresh", False)
+            nf, cfg = timesnet_model.train_timesnet(df, cfg, save_dir="models", resume=tn_resume, fresh=tn_fresh)
+            preds = timesnet_model.predict_timesnet(nf, df)
+            print(f"[train-all][TimesNet] 训练完成，和值预测≈{preds['sum_pred']:.2f}，蓝球预测≈{preds['blue_pred']:.2f}")
+
+    # Blender（蓝球/和值/红球位置动态加权示例）
+    if args.run_blend:
+        print("[train-all][Blender] 构建基础预测并训练融合模型...")
+
+        base_predictors = []
+        # 1) CatBoost
+        if not args.no_cat and len(df) >= args.cat_window + 1:
+            cat_models = ml_model.train_models(
+                df,
+                window=args.cat_window,
+                iterations=args.cat_iter,
+                depth=args.cat_depth,
+                learning_rate=args.cat_lr,
+            )
+
+            def pred_cat(hist_df):
+                return ml_model.predict_next(cat_models, hist_df, top_k=1)
+
+            base_predictors.append(pred_cat)
+
+        # 2) Transformer
+        if not args.no_seq and len(df) >= args.seq_window + 1:
+            seq_cfg = seq_model.TrainConfig(
+                window=args.seq_window,
+                batch_size=64,
+                epochs=max(1, min(args.seq_epochs, 10)),  # 融合阶段减小训练轮数加速
+                lr=args.seq_lr,
+                d_model=args.seq_d_model,
+                nhead=args.seq_nhead,
+                num_layers=args.seq_layers,
+                ff=args.seq_ff,
+                dropout=args.seq_dropout,
+                topk=1,
+            )
+            seq_resume = not args.seq_no_resume
+            seq_fresh = args.seq_fresh
+            seq_m, seq_cfg = seq_model.train_seq_model(df, seq_cfg, save_dir="models", resume=seq_resume, fresh=seq_fresh)
+
+            def pred_seq(hist_df):
+                return seq_model.predict_seq(seq_m, seq_cfg, hist_df)
+
+            base_predictors.append(pred_seq)
+
+        # 3) TFT
+        if args.run_tft and len(df) >= args.tft_window + 1:
+            tft_cfg = tft_model.TFTConfig(
+                window=args.tft_window,
+                batch=args.tft_batch,
+                epochs=max(1, min(args.tft_epochs, 10)),
+                lr=args.tft_lr,
+                d_model=args.tft_d_model,
+                nhead=args.tft_nhead,
+                layers=args.tft_layers,
+                ff=args.tft_ff,
+                dropout=args.tft_dropout,
+                topk=1,
+                freq_window=args.tft_freq_window,
+                entropy_window=args.tft_entropy_window,
+            )
+            tft_resume = not args.tft_no_resume
+            tft_fresh = args.tft_fresh
+            tft_m, tft_cfg = tft_model.train_tft(df, tft_cfg, save_dir="models", resume=tft_resume, fresh=tft_fresh)
+
+            def pred_tft(hist_df):
+                return tft_model.predict_tft(tft_m, tft_cfg, hist_df)
+
+            base_predictors.append(pred_tft)
+
+        # 4) N-HiTS（取蓝球点预测作为特征）
+        if args.run_nhits and len(df) >= args.nhits_input + 1:
+            nh_cfg = nhits_model.NHitsConfig(
+                input_size=args.nhits_input,
+                h=1,
+                n_layers=args.nhits_layers,
+                n_blocks=args.nhits_blocks,
+                n_harmonics=2,
+                n_polynomials=1,
+                dropout=0.1,
+                learning_rate=args.nhits_lr,
+                max_steps=max(50, min(args.nhits_steps, 200)),
+                batch_size=32,
+                valid_size=0.1,
+                topk=1,
+            )
+            nh_resume = not args.nhits_no_resume
+            nh_fresh = args.nhits_fresh
+            nh_m, nh_cfg = nhits_model.train_nhits(df, nh_cfg, save_dir="models", resume=nh_resume, fresh=nh_fresh)
+
+            def pred_nh(hist_df):
+                return nhits_model.predict_nhits(nh_m, nh_cfg, hist_df)
+
+            base_predictors.append(pred_nh)
+
+        # 5) TimesNet（蓝球点预测）
+        if args.run_timesnet and len(df) >= args.timesnet_input + 1:
+            tn_cfg = timesnet_model.TimesNetConfig(
+                input_size=args.timesnet_input,
+                h=1,
+                hidden_size=args.timesnet_hidden,
+                top_k=args.timesnet_topk,
+                dropout=args.timesnet_dropout,
+                learning_rate=args.timesnet_lr,
+                max_steps=max(50, min(args.timesnet_steps, 300)),
+                batch_size=32,
+                valid_size=0.1,
+            )
+            tn_resume = not args.timesnet_no_resume
+            tn_fresh = args.timesnet_fresh
+            tn_m, tn_cfg = timesnet_model.train_timesnet(df, tn_cfg, save_dir="models", resume=tn_resume, fresh=tn_fresh)
+
+            def pred_tn(hist_df):
+                return timesnet_model.predict_timesnet(tn_m, hist_df)
+
+            base_predictors.append(pred_tn)
+
+        # 6) Prophet（蓝球点预测）
+        if args.run_prophet and len(df) >= 30:
+            pr_cfg = prophet_model.ProphetConfig()
+            pr_resume = not args.prophet_no_resume
+            pr_fresh = args.prophet_fresh
+            pr_m, pr_cfg = prophet_model.train_prophet(df, pr_cfg, save_dir="models", resume=pr_resume, fresh=pr_fresh)
+
+            def pred_pr(hist_df):
+                return prophet_model.predict_prophet(pr_m, hist_df)
+
+            base_predictors.append(pred_pr)
+
+        if len(base_predictors) < 2:
+            print("[train-all][Blender] 基础模型不足2个，跳过融合")
+        else:
+            blend_cfg = blender.BlendConfig(train_size=300, test_size=30, step=30, alpha=0.3, l1_ratio=0.1)
+            # 蓝球
+            avg_acc_b, folds_b = blender.rolling_blend_blue(df, base_predictors, cfg=blend_cfg)
+            fused_num_b, fused_prob_b = blender.blend_blue_latest(df, base_predictors)
+            print(f"[train-all][Blender] 蓝球 Top1 平均命中率: {avg_acc_b:.3f} (折数 {len(folds_b)})，最新融合预测: {fused_num_b} (prob={fused_prob_b:.3f})")
+            # 和值
+            avg_mae_s, folds_s = blender.rolling_blend_sum(df, base_predictors, cfg=blend_cfg)
+            fused_sum = blender.blend_sum_latest(df, base_predictors)
+            print(f"[train-all][Blender] 和值融合 MAE: {avg_mae_s:.3f} (折数 {len(folds_s)})，最新融合和值≈{fused_sum:.2f}")
+            # 红球位置
+            avg_acc_r, folds_r = blender.rolling_blend_red(df, base_predictors, cfg=blend_cfg)
+            fused_red = blender.blend_red_latest(df, base_predictors)
+            print(f"[train-all][Blender] 红球位置 Top1 平均命中率: {avg_acc_r:.3f} (折数 {len(folds_r)})，最新融合红球: {fused_red}")
+
+    print("[train-all] 执行完毕")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="双色球爬取与混沌概率分析")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_sync = sub.add_parser("sync", help="抓取/增量更新双色球开奖数据")
+    p_sync.add_argument("--db", default="data/ssq.db", help="SQLite 数据库路径")
+    p_sync.set_defaults(func=cmd_sync)
+
+    p_analyze = sub.add_parser("analyze", help="分析数据库中的开奖数据")
+    p_analyze.add_argument("--db", default="data/ssq.db", help="SQLite 数据库路径")
+    p_analyze.add_argument("--recent", type=int, help="仅分析最近 N 期")
+    p_analyze.add_argument(
+        "--entropy-window",
+        type=int,
+        default=60,
+        help="滑动窗口大小，用于熵与混沌指标计算（单位：号码个数）",
+    )
+    p_analyze.set_defaults(func=cmd_analyze)
+
+    p_pred = sub.add_parser("predict", help="使用 CatBoost 进行下一期概率预测（位置模型）")
+    p_pred.add_argument("--db", default="data/ssq.db", help="SQLite 数据库路径")
+    p_pred.add_argument("--recent", type=int, default=400, help="训练使用的最近 N 期样本（默认400）")
+    p_pred.add_argument("--window", type=int, default=10, help="滑窗长度")
+    p_pred.add_argument("--topk", type=int, default=3, help="每个位置输出前 topk 个号码及概率")
+    p_pred.add_argument("--iter", type=int, default=300, help="CatBoost 迭代轮数")
+    p_pred.add_argument("--depth", type=int, default=6, help="CatBoost 树深度")
+    p_pred.add_argument("--lr", type=float, default=0.1, help="CatBoost 学习率")
+    p_pred.add_argument("--cat-fresh", action="store_true", help="强制重训 CatBoost 并覆盖保存")
+    p_pred.add_argument("--cat-no-resume", action="store_true", help="不加载已保存 CatBoost 模型")
+    p_pred.add_argument("--bayes-cat", action="store_true", help="启用 CatBoost 贝叶斯调参")
+    p_pred.add_argument("--bayes-cat-calls", type=int, default=8, help="CatBoost 贝叶斯搜索迭代次数")
+    p_pred.add_argument("--bayes-cat-cv", type=int, default=3, help="CatBoost 贝叶斯调参交叉验证折数")
+    p_pred.add_argument("--seq-fresh", action="store_true", help="强制重训 Transformer 并覆盖保存")
+    p_pred.add_argument("--seq-no-resume", action="store_true", help="不加载已保存 Transformer 模型")
+    p_pred.add_argument("--tft-fresh", action="store_true", help="强制重训 TFT 并覆盖保存")
+    p_pred.add_argument("--tft-no-resume", action="store_true", help="不加载已保存 TFT 模型")
+    p_pred.add_argument("--bayes-seq", action="store_true", help="启用 Transformer 贝叶斯调参")
+    p_pred.add_argument("--bayes-seq-calls", type=int, default=6, help="Transformer 贝叶斯搜索迭代次数")
+    p_pred.add_argument("--bayes-seq-recent", type=int, default=300, help="Transformer 贝叶斯调参使用的最近样本数")
+    p_pred.add_argument("--bayes-tft", action="store_true", help="启用 TFT 贝叶斯调参")
+    p_pred.add_argument("--bayes-tft-calls", type=int, default=4, help="TFT 贝叶斯搜索迭代次数")
+    p_pred.add_argument("--bayes-tft-recent", type=int, default=400, help="TFT 贝叶斯调参使用的最近样本数")
+    p_pred.add_argument("--nhits-fresh", action="store_true", help="强制重训 N-HiTS 并覆盖保存")
+    p_pred.add_argument("--nhits-no-resume", action="store_true", help="不加载已保存 N-HiTS 模型")
+    p_pred.add_argument("--bayes-nhits", action="store_true", help="启用 N-HiTS 贝叶斯调参")
+    p_pred.add_argument("--bayes-nhits-calls", type=int, default=4, help="N-HiTS 贝叶斯搜索迭代次数")
+    p_pred.add_argument("--bayes-nhits-recent", type=int, default=300, help="N-HiTS 贝叶斯调参使用的最近样本数")
+    p_pred.add_argument("--timesnet-fresh", action="store_true", help="强制重训 TimesNet 并覆盖保存")
+    p_pred.add_argument("--timesnet-no-resume", action="store_true", help="不加载已保存 TimesNet 模型")
+    p_pred.add_argument("--bayes-timesnet", action="store_true", help="启用 TimesNet 贝叶斯调参")
+    p_pred.add_argument("--bayes-timesnet-calls", type=int, default=4, help="TimesNet 贝叶斯搜索迭代次数")
+    p_pred.add_argument("--bayes-timesnet-recent", type=int, default=400, help="TimesNet 贝叶斯调参使用的最近样本数")
+    p_pred.add_argument("--prophet-fresh", action="store_true", help="强制重训 Prophet 并覆盖保存")
+    p_pred.add_argument("--prophet-no-resume", action="store_true", help="不加载已保存 Prophet 模型")
+    p_pred.add_argument("--bayes-prophet", action="store_true", help="启用 Prophet 贝叶斯调参")
+    p_pred.add_argument("--bayes-prophet-calls", type=int, default=4, help="Prophet 贝叶斯搜索迭代次数")
+    p_pred.add_argument("--bayes-prophet-recent", type=int, default=200, help="Prophet 贝叶斯调参使用的最近样本数")
+    p_pred.set_defaults(func=cmd_predict)
+
+    p_pred_seq = sub.add_parser("predict-seq", help="使用 Transformer 序列模型进行下一期预测")
+    p_pred_seq.add_argument("--db", default="data/ssq.db", help="SQLite 数据库路径")
+    p_pred_seq.add_argument("--recent", type=int, default=600, help="训练使用的最近 N 期样本（默认600）")
+    p_pred_seq.add_argument("--window", type=int, default=20, help="滑窗长度")
+    p_pred_seq.add_argument("--epochs", type=int, default=30, help="训练轮数")
+    p_pred_seq.add_argument("--batch", type=int, default=64, help="batch size")
+    p_pred_seq.add_argument("--lr", type=float, default=1e-3, help="学习率")
+    p_pred_seq.add_argument("--d-model", dest="d_model", type=int, default=96, help="模型隐层维度")
+    p_pred_seq.add_argument("--nhead", type=int, default=4, help="多头注意力头数")
+    p_pred_seq.add_argument("--layers", type=int, default=3, help="Transformer 层数")
+    p_pred_seq.add_argument("--ff", type=int, default=192, help="前馈层维度")
+    p_pred_seq.add_argument("--dropout", type=float, default=0.1, help="dropout")
+    p_pred_seq.add_argument("--topk", type=int, default=3, help="输出前 topk 个号码及概率")
+    p_pred_seq.add_argument("--seq-fresh", action="store_true", help="强制重训并覆盖保存")
+    p_pred_seq.add_argument("--seq-no-resume", action="store_true", help="不加载已保存模型")
+    p_pred_seq.set_defaults(func=cmd_predict_seq)
+
+    p_pred_tft = sub.add_parser("predict-tft", help="使用 TFT 风格序列模型进行下一期预测")
+    p_pred_tft.add_argument("--db", default="data/ssq.db", help="SQLite 数据库路径")
+    p_pred_tft.add_argument("--recent", type=int, default=800, help="训练使用的最近 N 期样本（默认800）")
+    p_pred_tft.add_argument("--window", type=int, default=20, help="滑窗长度")
+    p_pred_tft.add_argument("--epochs", type=int, default=30, help="训练轮数")
+    p_pred_tft.add_argument("--batch", type=int, default=64, help="batch size")
+    p_pred_tft.add_argument("--lr", type=float, default=1e-3, help="学习率")
+    p_pred_tft.add_argument("--d-model", dest="d_model", type=int, default=128, help="模型维度")
+    p_pred_tft.add_argument("--nhead", type=int, default=4, help="多头注意力头数")
+    p_pred_tft.add_argument("--layers", type=int, default=3, help="Transformer 层数")
+    p_pred_tft.add_argument("--ff", type=int, default=256, help="前馈层维度")
+    p_pred_tft.add_argument("--dropout", type=float, default=0.1, help="dropout")
+    p_pred_tft.add_argument("--topk", type=int, default=3, help="输出前 topk 个号码及概率")
+    p_pred_tft.add_argument("--tft-fresh", action="store_true", help="强制重训并覆盖保存")
+    p_pred_tft.add_argument("--tft-no-resume", action="store_true", help="不加载已保存模型")
+    p_pred_tft.set_defaults(func=cmd_predict_tft)
+
+    p_tune_cat = sub.add_parser("tune-cat", help="贝叶斯优化 CatBoost 蓝球模型")
+    p_tune_cat.add_argument("--db", default="data/ssq.db", help="SQLite 数据库路径")
+    p_tune_cat.add_argument("--recent", type=int, default=400, help="使用最近 N 期样本")
+    p_tune_cat.add_argument("--window", type=int, default=10, help="滑窗长度")
+    p_tune_cat.add_argument("--n-iter", dest="n_iter", type=int, default=15, help="贝叶斯搜索迭代次数")
+    p_tune_cat.add_argument("--cv", type=int, default=3, help="交叉验证折数")
+    p_tune_cat.add_argument("--topk", type=int, default=3, help="输出前 topk 个蓝球")
+    p_tune_cat.set_defaults(func=cmd_tune_cat)
+
+    p_cv_cat = sub.add_parser("cv-cat", help="CatBoost 位置模型滚动验证")
+    p_cv_cat.add_argument("--db", default="data/ssq.db", help="SQLite 数据库路径")
+    p_cv_cat.add_argument("--recent", type=int, default=800, help="使用最近 N 期")
+    p_cv_cat.add_argument("--window", type=int, default=10, help="CatBoost 滑窗")
+    p_cv_cat.add_argument("--iter", type=int, default=200, help="CatBoost 迭代轮数")
+    p_cv_cat.add_argument("--depth", type=int, default=6, help="CatBoost 深度")
+    p_cv_cat.add_argument("--lr", type=float, default=0.1, help="CatBoost 学习率")
+    p_cv_cat.add_argument("--train", type=int, default=300, help="每折训练集大小")
+    p_cv_cat.add_argument("--test", type=int, default=20, help="每折测试集大小")
+    p_cv_cat.add_argument("--step", type=int, default=20, help="窗口滑动步长")
+    p_cv_cat.set_defaults(func=cmd_cv_cat)
+
+    p_cv_tft = sub.add_parser("cv-tft", help="TFT 序列模型滚动验证")
+    p_cv_tft.add_argument("--db", default="data/ssq.db", help="SQLite 数据库路径")
+    p_cv_tft.add_argument("--recent", type=int, default=800, help="使用最近 N 期")
+    p_cv_tft.add_argument("--window", type=int, default=20, help="滑窗")
+    p_cv_tft.add_argument("--epochs", type=int, default=30, help="训练轮数")
+    p_cv_tft.add_argument("--batch", type=int, default=64, help="batch size")
+    p_cv_tft.add_argument("--lr", type=float, default=1e-3, help="学习率")
+    p_cv_tft.add_argument("--d-model", dest="d_model", type=int, default=128, help="模型维度")
+    p_cv_tft.add_argument("--nhead", type=int, default=4, help="多头注意力头数")
+    p_cv_tft.add_argument("--layers", type=int, default=3, help="Transformer 层数")
+    p_cv_tft.add_argument("--ff", type=int, default=256, help="前馈层维度")
+    p_cv_tft.add_argument("--dropout", type=float, default=0.1, help="dropout")
+    p_cv_tft.add_argument("--freq-window", dest="freq_window", type=int, default=50, help="频率特征滑窗")
+    p_cv_tft.add_argument("--entropy-window", dest="entropy_window", type=int, default=50, help="熵特征滑窗")
+    p_cv_tft.add_argument("--train", type=int, default=400, help="每折训练集大小")
+    p_cv_tft.add_argument("--test", type=int, default=40, help="每折测试集大小")
+    p_cv_tft.add_argument("--step", type=int, default=40, help="窗口滑动步长")
+    p_cv_tft.set_defaults(func=cmd_cv_tft)
+
+    p_train_all = sub.add_parser("train-all", help="一条命令依次训练 CatBoost / Transformer / TFT")
+    p_train_all.add_argument("--db", default="data/ssq.db", help="SQLite 数据库路径")
+    p_train_all.add_argument("--sync", action="store_true", help="训练前先同步数据")
+    p_train_all.add_argument("--recent", type=int, default=800, help="使用最近 N 期样本")
+    # CatBoost
+    p_train_all.add_argument("--no-cat", action="store_true", help="跳过 CatBoost 训练")
+    p_train_all.add_argument("--cat-window", type=int, default=10, help="CatBoost 滑窗长度")
+    p_train_all.add_argument("--cat-iter", type=int, default=300, help="CatBoost 迭代轮数")
+    p_train_all.add_argument("--cat-depth", type=int, default=6, help="CatBoost 树深度")
+    p_train_all.add_argument("--cat-lr", type=float, default=0.1, help="CatBoost 学习率")
+    p_train_all.add_argument("--cat-fresh", action="store_true", help="强制重训 CatBoost 并覆盖保存")
+    p_train_all.add_argument("--cat-no-resume", action="store_true", help="不加载已保存 CatBoost 模型")
+    p_train_all.add_argument("--bayes-cat", action="store_true", help="开启 CatBoost 贝叶斯调参")
+    p_train_all.add_argument("--bayes-cat-calls", type=int, default=8, help="CatBoost 贝叶斯搜索迭代次数")
+    p_train_all.add_argument("--bayes-cat-cv", type=int, default=3, help="CatBoost 贝叶斯调参交叉验证折数")
+    # Transformer
+    p_train_all.add_argument("--no-seq", action="store_true", help="跳过 Transformer 训练")
+    p_train_all.add_argument("--seq-window", type=int, default=20, help="Transformer 滑窗")
+    p_train_all.add_argument("--seq-epochs", type=int, default=20, help="Transformer 训练轮数")
+    p_train_all.add_argument("--seq-d-model", dest="seq_d_model", type=int, default=96)
+    p_train_all.add_argument("--seq-nhead", type=int, default=4)
+    p_train_all.add_argument("--seq-layers", type=int, default=3)
+    p_train_all.add_argument("--seq-ff", type=int, default=192)
+    p_train_all.add_argument("--seq-dropout", type=float, default=0.1)
+    p_train_all.add_argument("--seq-lr", type=float, default=1e-3)
+    p_train_all.add_argument("--seq-fresh", action="store_true", help="强制重训 Transformer 并覆盖保存")
+    p_train_all.add_argument("--seq-no-resume", action="store_true", help="不加载已保存 Transformer 模型")
+    p_train_all.add_argument("--bayes-seq", action="store_true", help="开启 Transformer 贝叶斯调参")
+    p_train_all.add_argument("--bayes-seq-calls", type=int, default=6, help="Transformer 贝叶斯搜索迭代次数")
+    p_train_all.add_argument("--bayes-seq-recent", type=int, default=400, help="Transformer 贝叶斯调参使用的最近样本数")
+    # TFT
+    p_train_all.add_argument("--run-tft", action="store_true", help="开启 TFT 训练（耗时更长）")
+    p_train_all.add_argument("--tft-window", type=int, default=20)
+    p_train_all.add_argument("--tft-epochs", type=int, default=20)
+    p_train_all.add_argument("--tft-batch", type=int, default=64)
+    p_train_all.add_argument("--tft-lr", type=float, default=1e-3)
+    p_train_all.add_argument("--tft-d-model", dest="tft_d_model", type=int, default=128)
+    p_train_all.add_argument("--tft-nhead", type=int, default=4)
+    p_train_all.add_argument("--tft-layers", type=int, default=3)
+    p_train_all.add_argument("--tft-ff", type=int, default=256)
+    p_train_all.add_argument("--tft-dropout", type=float, default=0.1)
+    p_train_all.add_argument("--tft-freq-window", dest="tft_freq_window", type=int, default=50)
+    p_train_all.add_argument("--tft-entropy-window", dest="tft_entropy_window", type=int, default=50)
+    p_train_all.add_argument("--tft-fresh", action="store_true", help="强制重训 TFT 并覆盖保存")
+    p_train_all.add_argument("--tft-no-resume", action="store_true", help="不加载已保存 TFT 模型")
+    p_train_all.add_argument("--bayes-tft", action="store_true", help="开启 TFT 贝叶斯调参")
+    p_train_all.add_argument("--bayes-tft-calls", type=int, default=4, help="TFT 贝叶斯搜索迭代次数")
+    p_train_all.add_argument("--bayes-tft-recent", type=int, default=400, help="TFT 贝叶斯调参使用的最近样本数")
+    # N-HiTS
+    p_train_all.add_argument("--run-nhits", action="store_true", help="开启 N-HiTS 训练（和值+蓝球单变量）")
+    p_train_all.add_argument("--nhits-input", type=int, default=60, help="N-HiTS 输入窗口")
+    p_train_all.add_argument("--nhits-layers", type=int, default=2, help="N-HiTS 层数")
+    p_train_all.add_argument("--nhits-blocks", type=int, default=1, help="N-HiTS block 数")
+    p_train_all.add_argument("--nhits-steps", type=int, default=200, help="训练步数")
+    p_train_all.add_argument("--nhits-lr", type=float, default=1e-3, help="学习率")
+    p_train_all.add_argument("--nhits-fresh", action="store_true", help="强制重训 N-HiTS 并覆盖保存")
+    p_train_all.add_argument("--nhits-no-resume", action="store_true", help="不加载已保存 N-HiTS 模型")
+    p_train_all.add_argument("--bayes-nhits", action="store_true", help="开启 N-HiTS 贝叶斯调参")
+    p_train_all.add_argument("--bayes-nhits-calls", type=int, default=4, help="N-HiTS 贝叶斯搜索迭代次数")
+    p_train_all.add_argument("--bayes-nhits-recent", type=int, default=300, help="N-HiTS 贝叶斯调参使用的最近样本数")
+    # Prophet
+    p_train_all.add_argument("--run-prophet", action="store_true", help="开启 Prophet 训练（和值/蓝球单变量）")
+    p_train_all.add_argument("--prophet-fresh", action="store_true", help="强制重训 Prophet 并覆盖保存")
+    p_train_all.add_argument("--prophet-no-resume", action="store_true", help="不加载已保存 Prophet 模型")
+    p_train_all.add_argument("--bayes-prophet", action="store_true", help="开启 Prophet 贝叶斯调参")
+    p_train_all.add_argument("--bayes-prophet-calls", type=int, default=4, help="Prophet 贝叶斯搜索迭代次数")
+    p_train_all.add_argument("--bayes-prophet-recent", type=int, default=200, help="Prophet 贝叶斯调参使用的最近样本数")
+    # Blender
+    p_train_all.add_argument("--run-blend", action="store_true", help="开启融合（蓝球/和值/红球位置动态加权）")
+    # TimesNet
+    p_train_all.add_argument("--run-timesnet", action="store_true", help="开启 TimesNet 训练（和值+蓝球单变量）")
+    p_train_all.add_argument("--timesnet-input", type=int, default=120, help="TimesNet 输入窗口")
+    p_train_all.add_argument("--timesnet-hidden", type=int, default=64, help="TimesNet 隐层维度")
+    p_train_all.add_argument("--timesnet-topk", type=int, default=5, help="TimesNet top_k")
+    p_train_all.add_argument("--timesnet-steps", type=int, default=300, help="TimesNet 训练步数")
+    p_train_all.add_argument("--timesnet-lr", type=float, default=1e-3, help="TimesNet 学习率")
+    p_train_all.add_argument("--timesnet-dropout", type=float, default=0.1, help="TimesNet dropout")
+    p_train_all.add_argument("--timesnet-fresh", action="store_true", help="强制重训 TimesNet 并覆盖保存")
+    p_train_all.add_argument("--timesnet-no-resume", action="store_true", help="不加载已保存 TimesNet 模型")
+    p_train_all.add_argument("--bayes-timesnet", action="store_true", help="开启 TimesNet 贝叶斯调参")
+    p_train_all.add_argument("--bayes-timesnet-calls", type=int, default=4, help="TimesNet 贝叶斯搜索迭代次数")
+    p_train_all.add_argument("--bayes-timesnet-recent", type=int, default=400, help="TimesNet 贝叶斯调参使用的最近样本数")
+    p_train_all.set_defaults(func=cmd_train_all)
+    return parser
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
+
