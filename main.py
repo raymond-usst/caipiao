@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import pandas as pd
 import numpy as np
-import numpy as np
 
 # 统一控制台编码为 UTF-8，避免中文输出乱码（Windows PowerShell 常见）
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
@@ -218,6 +217,19 @@ def cmd_predict(args) -> None:
 
     base_predictors.append(pred_freq)
 
+    # 随机基线（不训练）：均匀采样 6 个红球 + 1 个蓝球，便于评估模型相对优势
+    def pred_random(hist_df):
+        rng = np.random.default_rng(len(hist_df))  # 使同样窗口长度可复现
+        red_nums = rng.choice(np.arange(1, 34), size=6, replace=False)
+        blue_num = int(rng.integers(1, 17))
+        red_preds = {i + 1: [(int(n), 1.0 / 6)] for i, n in enumerate(red_nums)}
+        blue_preds = [(blue_num, 1.0)]
+        # 使用最近一期和值作为简单占位
+        last_sum = float(hist_df[["red1", "red2", "red3", "red4", "red5", "red6", "blue"]].iloc[-1].sum())
+        return {"red": red_preds, "blue": blue_preds, "sum_pred": last_sum}
+
+    base_predictors.append(pred_random)
+
     # Transformer
     try:
         # 默认超参
@@ -396,8 +408,15 @@ def cmd_predict(args) -> None:
         base_predictors.append(pred_nh)
         if getattr(args, "nhits_backtest", False):
             try:
-                bt = nhits_model.backtest_nhits_model(nh_cfg, df, batch_size=args.nhits_backtest_batch)
-                print(f"[predict][nhits][backtest] sum_mae={bt['sum_mae']:.3f}, blue_acc={bt['blue_acc']:.3f}, samples={bt['samples']}")
+                bt = nhits_model.backtest_nhits_model(
+                    nh_m,
+                    nh_cfg,
+                    df,
+                    max_samples=getattr(args, "nhits_backtest_samples", None),
+                )
+                print(
+                    f"[predict][nhits][backtest] mae_sum={bt['mae_sum']:.3f}, mae_blue={bt['mae_blue']:.3f}, blue_top1={bt['blue_top1']:.3f}, samples={bt['samples']}"
+                )
             except Exception as e:
                 print(f"[predict][nhits][backtest][warn] {e}")
         print("[predict][nhits] added to blend")
@@ -502,15 +521,16 @@ def cmd_predict(args) -> None:
 
     # Stacking 元学习（蓝球 / 红球位置），使用概率向量特征
     try:
-        stack_bayes = getattr(args, "stack_bayes", False)
-        n_calls = getattr(args, "stack_bayes_calls", 6)
+        # 强制启用贝叶斯调参的 stacking，确保 meta-learner 学习模型优劣
+        n_calls = max(getattr(args, "stack_bayes_calls", 6), 10)
+        stack_bayes = True
         # 蓝球 stacking
-        scaler_b, meta_b = blender.train_stacking_blue(df, base_predictors, bayes=stack_bayes, n_iter=n_calls)
-        stack_blue_num, stack_blue_prob = blender.predict_stacking_blue(df, base_predictors, scaler_b, meta_b)
+        scaler_b, meta_b, le_b = blender.train_stacking_blue(df, base_predictors, bayes=stack_bayes, n_iter=n_calls)
+        stack_blue_num, stack_blue_prob = blender.predict_stacking_blue(df, base_predictors, scaler_b, meta_b, le_b)
         print(f"[predict][stack] 蓝球 Top1: {stack_blue_num} (prob={stack_blue_prob:.3f})")
         # 红球位置 stacking
-        scalers_r, models_r = blender.train_stacking_red(df, base_predictors, bayes=stack_bayes, n_iter=n_calls)
-        stack_red = blender.predict_stacking_red(df, base_predictors, scalers_r, models_r, topk=1)
+        scalers_r, models_r, les_r = blender.train_stacking_red(df, base_predictors, bayes=stack_bayes, n_iter=n_calls)
+        stack_red = blender.predict_stacking_red(df, base_predictors, scalers_r, models_r, les_r, topk=1)
         print(f"[predict][stack] 红球位置 Top1: {stack_red}")
     except Exception as e:
         print(f"[predict][stack][warn] 跳过 stacking: {e}")

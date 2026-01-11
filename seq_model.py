@@ -230,7 +230,7 @@ def _quick_seq_loss(df: pd.DataFrame, cfg: TrainConfig, max_epochs: int = 6) -> 
 def bayes_optimize_seq(
     df: pd.DataFrame,
     recent: int = 400,
-    n_iter: int = 8,
+    n_iter: int = 15,
     random_state: int = 42,
 ):
     """
@@ -247,14 +247,14 @@ def bayes_optimize_seq(
     if len(df_recent) < 60:
         raise ValueError("样本不足，无法进行 Transformer 贝叶斯调参")
 
-    space = [
-        Integer(8, 16, name="window"),
-        Integer(64, 160, name="d_model"),
-        Categorical([2, 4, 6], name="nhead"),
+    space_coarse = [
+        Integer(10, 20, name="window"),
+        Integer(96, 192, name="d_model"),
+        Categorical([2, 4], name="nhead"),
         Integer(2, 4, name="num_layers"),
-        Integer(128, 320, name="ff"),
-        Real(0.0, 0.3, name="dropout"),
-        Real(1e-4, 3e-3, prior="log-uniform", name="lr"),
+        Integer(160, 360, name="ff"),
+        Real(0.05, 0.25, name="dropout"),
+        Real(3e-4, 3e-3, prior="log-uniform", name="lr"),
         Categorical([32, 64], name="batch_size"),
     ]
 
@@ -278,15 +278,71 @@ def bayes_optimize_seq(
             return 1e3
         return loss
 
-    res = gp_minimize(
-        objective,
-        space,
-        n_calls=n_iter,
-        random_state=random_state,
-        verbose=False,
-    )
-    best = res.x
-    best_loss = float(res.fun)
+    n_calls = max(int(n_iter), 12)
+    n_coarse = max(6, n_calls // 2)
+    n_fine = max(6, n_calls - n_coarse)
+
+    def _run_search(space, calls):
+        try:
+            res = gp_minimize(
+                objective,
+                space,
+                n_calls=calls,
+                random_state=random_state,
+                verbose=False,
+            )
+            return res.x, float(res.fun)
+        except Exception:
+            rng = np.random.default_rng(random_state)
+            loc_best = None
+            loc_loss = 1e9
+            for _ in range(calls):
+                w = rng.integers(space[0].low, space[0].high + 1)
+                dm = rng.integers(space[1].low, space[1].high + 1)
+                nh = rng.choice(space[2].categories)
+                nl = rng.integers(space[3].low, space[3].high + 1)
+                ff = rng.integers(space[4].low, space[4].high + 1)
+                dr = float(rng.uniform(space[5].low, space[5].high))
+                lr = float(np.exp(rng.uniform(np.log(space[6].low), np.log(space[6].high))))
+                bs = int(rng.choice(space[7].categories))
+                cfg = TrainConfig(
+                    window=int(w),
+                    batch_size=bs,
+                    epochs=6,
+                    lr=lr,
+                    d_model=int(dm),
+                    nhead=int(nh),
+                    num_layers=int(nl),
+                    ff=int(ff),
+                    dropout=dr,
+                    topk=1,
+                )
+                try:
+                    loss = _quick_seq_loss(df_recent, cfg, max_epochs=6)
+                except Exception:
+                    loss = 1e3
+                if loss < loc_loss:
+                    loc_loss = loss
+                    loc_best = [w, dm, nh, nl, ff, dr, lr, bs]
+            return loc_best, loc_loss
+
+    best, best_loss = _run_search(space_coarse, n_coarse)
+
+    if best is not None:
+        b_w, b_dm, b_nh, b_nl, b_ff, b_dr, b_lr, b_bs = best
+        space_fine = [
+            Integer(max(6, int(b_w) - 4), min(24, int(b_w) + 4), name="window"),
+            Integer(max(64, int(b_dm) - 48), min(240, int(b_dm) + 48), name="d_model"),
+            Categorical([b_nh, 2, 4]),
+            Integer(max(1, int(b_nl) - 1), min(6, int(b_nl) + 1), name="num_layers"),
+            Integer(max(128, int(b_ff) - 100), min(512, int(b_ff) + 100), name="ff"),
+            Real(max(0.01, b_dr / 2), min(0.3, b_dr * 2), name="dropout"),
+            Real(max(1e-4, b_lr / 2), min(5e-3, b_lr * 2), prior="log-uniform", name="lr"),
+            Categorical([b_bs, 32, 64]),
+        ]
+        fine_res, fine_loss = _run_search(space_fine, n_fine)
+        if fine_res is not None and fine_loss < best_loss:
+            best, best_loss = fine_res, fine_loss
     best_params = {
         "window": best[0],
         "d_model": best[1],
@@ -327,7 +383,7 @@ def train_seq_model(
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
         if resume and not fresh and ckpt_path.exists():
             try:
-                state = torch.load(ckpt_path, map_location=device)
+                state = torch.load(ckpt_path, map_location=device, weights_only=True)
                 model.load_state_dict(state)
                 model.eval()
                 print(f"[Transformer] 检测到已保存模型，直接加载 {ckpt_path}")

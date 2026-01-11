@@ -1,3 +1,90 @@
+# 双色球爬取、分析与多模型融合预测 / Double Color Ball Scraping, Analysis & Ensemble Forecasting
+
+## 快速开始 / Quick Start
+- 安装依赖 / Install
+  ```bash
+  pip install -r requirements.txt
+  ```
+- 初始化数据 / Sync all history
+  ```bash
+  python main.py sync --db data/ssq.db
+  ```
+- 基础分析 / Analyze
+  ```bash
+  python main.py analyze --db data/ssq.db --recent 200
+  ```
+- 可视化 UI / Streamlit UI
+  ```bash
+  streamlit run app.py
+  ```
+- 预测（多模型+融合+stacking）/ Predict (multi-model + blend + stacking)
+  ```bash
+  python main.py predict --db data/ssq.db --recent 400 --window 10 --topk 3 \
+    --bayes-cat --bayes-seq --bayes-tft --bayes-nhits --bayes-timesnet --bayes-prophet \
+    --stack-bayes
+  ```
+  可选流式回测 / optional streaming backtest: `--seq-backtest --tft-backtest --nhits-backtest --timesnet-backtest`
+
+## 全量高强度训练示例 / Full intensive run example
+```bash
+python main.py predict --db data/ssq.db --recent 0 --window 20 --topk 3 \
+  --cat-fresh --cat-no-resume --bayes-cat --bayes-cat-calls 12 --bayes-cat-cv 3 \
+  --seq-fresh --seq-no-resume --bayes-seq --bayes-seq-calls 10 --bayes-seq-recent 0 --seq-backtest --seq-backtest-batch 128 \
+  --tft-fresh --tft-no-resume --bayes-tft --bayes-tft-calls 10 --bayes-tft-recent 0 --tft-backtest --tft-backtest-batch 128 \
+  --nhits-fresh --nhits-no-resume --bayes-nhits --bayes-nhits-calls 8 --bayes-nhits-recent 0 --nhits-backtest --nhits-backtest-samples 500 \
+  --timesnet-fresh --timesnet-no-resume --bayes-timesnet --bayes-timesnet-calls 8 --bayes-timesnet-recent 0 --timesnet-backtest --timesnet-backtest-samples 500 \
+  --prophet-fresh --prophet-no-resume --bayes-prophet --bayes-prophet-calls 8 --bayes-prophet-recent 0 \
+  --stack-bayes --stack-bayes-calls 8
+```
+
+## 特性概览 / Features
+- 数据抓取与校验 / Data sync & validation：全量/增量拉取；入库前校验红 6 不重复且 1-33、蓝 1 且 1-16。
+- 分析 / Analytics：频率/冷热、卡方/游程、自相关、遗漏/周期、相空间、相关维数、FNN、RR/DET、Apriori。
+- 特征 / Features：AC 值、和值尾、跨度、奇偶/质合/大小比、遗漏、农历、周几等。
+- 模型 / Models（GPU 优先）：CatBoost、Transformer、TFT（多任务）、N-HiTS、TimesNet、Prophet；奇偶模型、和值标准差模型用于约束。
+- 融合与 stacking / Blending & stacking：动态加权融合；XGBoost 元模型（拼接各模型概率向量，支持贝叶斯调参）。
+- 约束与推荐 / Ticket constraints：高概率红/蓝 + 和值均值±预测标准差 + 奇偶预测生成复式；杀号阈值可配。
+- 回测 / Backtest：CatBoost/TFT 滚动验证；Transformer/TFT/N-HiTS/TimesNet 流式回测（IterableDataset）。
+
+## 贝叶斯调参增强 / Bayesian tuning enhancements
+- 多阶段搜索（粗-中-细）、动态 n_calls、自适应空间收缩、随机/局部扰动兜底。
+- TimesNet 专项：离散化空间，Optuna TPE + 多保真评估（轻筛选+重评），trimmed mean + std 惩罚，爆炸软罚+重试，连续失败放宽 lr/dropout。
+- 评估稳健化：多次评估取中位/trimmed mean；失败用软惩罚替代 1000 哨兵，避免搜索停滞。
+
+## 目录 / Project layout
+- `main.py`：CLI、调度、融合/stacking、复式与杀号。
+- `lottery/scraper.py`：爬虫。
+- `lottery/database.py`：SQLite schema 与校验。
+- `lottery/analyzer.py`：统计/混沌/Apriori。
+- `lottery/ml_model.py`，`seq_model.py`，`tft_model.py`，`nhits_model.py`，`timesnet_model.py`，`prophet_model.py`：各模型训练与调参。
+- `lottery/blender.py`：融合、stacking、复式、杀号。
+
+## 数据源 / Data sources
+- 主 / Primary：福彩官网 JSON（约 2013~今）  
+  `https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice`
+- 辅 / Secondary：500.com 历史页与分年段补齐 2003~2012  
+  `https://datachart.500.com/ssq/history/inc/history.php?start=0001&end=9999`
+
+## 常用命令 / Useful commands
+- 同步 / Sync：`python main.py sync --db data/ssq.db`
+- 分析 / Analyze：`python main.py analyze --db data/ssq.db --recent 200`
+- 预测 / Predict：见上方示例；可调 `--recent --window --topk`
+- 单模型序列 / Single model seq：
+  ```bash
+  python main.py predict-seq --db data/ssq.db --recent 600 --window 20 --epochs 30 --topk 3
+  python main.py predict-tft --db data/ssq.db --recent 800 --window 20 --epochs 30 --topk 3
+  ```
+- 滚动验证 / Rolling CV：
+  ```bash
+  python main.py cv-cat --db data/ssq.db --recent 800 --train 300 --test 20 --step 20
+  python main.py cv-tft --db data/ssq.db --recent 800 --train 400 --test 40 --step 40
+  ```
+- UI：`streamlit run app.py`
+
+## 注意 / Notes
+- 默认 SQLite 单机文件，可结合系统计划任务定时运行。
+- 遵守目标站 robots/频率要求，避免高频抓取。
+- GPU 环境优先，可根据资源调整 batch/steps 以平衡性能与耗时。
 # 双色球爬取、分析与多模型融合预测（含混沌指标）
 
 ## 快速开始

@@ -288,7 +288,7 @@ def _quick_tft_loss(df: pd.DataFrame, cfg: "TFTConfig", max_epochs: int = 4) -> 
 def bayes_optimize_tft(
     df: pd.DataFrame,
     recent: int = 400,
-    n_iter: int = 6,
+    n_iter: int = 15,
     random_state: int = 42,
 ):
     """
@@ -304,19 +304,27 @@ def bayes_optimize_tft(
     if len(df_recent) < 80:
         raise ValueError("样本不足，无法进行 TFT 贝叶斯调参")
 
-    space = [
-        Integer(8, 20, name="window"),
-        Integer(64, 192, name="d_model"),
+    space_coarse = [
+        Integer(10, 24, name="window"),
+        Integer(80, 192, name="d_model"),
         Categorical([2, 4], name="nhead"),
         Integer(2, 4, name="layers"),
-        Integer(128, 320, name="ff"),
-        Real(0.0, 0.3, name="dropout"),
-        Real(1e-4, 3e-3, prior="log-uniform", name="lr"),
+        Integer(160, 400, name="ff"),
+        Real(0.05, 0.25, name="dropout"),
+        Real(3e-4, 3e-3, prior="log-uniform", name="lr"),
         Categorical([32, 64], name="batch"),
     ]
 
+    def _adjust_dm(dm: int, nh: int, low: int, high: int) -> int:
+        dm_adj = int(np.ceil(dm / nh) * nh)
+        dm_adj = max(low, min(high, dm_adj))
+        if dm_adj % nh != 0:  # 再次兜底
+            dm_adj = (dm_adj // nh) * nh
+        return dm_adj
+
     def objective(params):
         w, dm, nh, ly, ff, dr, lr, bs = params
+        dm = _adjust_dm(dm, nh, space_coarse[1].low, space_coarse[1].high)
         cfg = TFTConfig(
             window=w,
             batch=bs,
@@ -337,19 +345,79 @@ def bayes_optimize_tft(
             return 1e3
         return loss
 
-    res = gp_minimize(
-        objective,
-        space,
-        n_calls=n_iter,
-        random_state=random_state,
-        verbose=False,
-    )
-    best = res.x
-    best_loss = float(res.fun)
+    n_calls = max(int(n_iter), 12)
+    n_coarse = max(6, n_calls // 2)
+    n_fine = max(6, n_calls - n_coarse)
+
+    def _run_search(space, calls):
+        try:
+            res = gp_minimize(
+                objective,
+                space,
+                n_calls=calls,
+                random_state=random_state,
+                verbose=False,
+            )
+            return res.x, float(res.fun)
+        except Exception:
+            rng = np.random.default_rng(random_state)
+            loc_best = None
+            loc_loss = 1e9
+            for _ in range(calls):
+                w = rng.integers(space[0].low, space[0].high + 1)
+                dm = rng.integers(space[1].low, space[1].high + 1)
+                nh = rng.choice(space[2].categories)
+                ly = rng.integers(space[3].low, space[3].high + 1)
+                ff = rng.integers(space[4].low, space[4].high + 1)
+                dr = float(rng.uniform(space[5].low, space[5].high))
+                lr = float(np.exp(rng.uniform(np.log(space[6].low), np.log(space[6].high))))
+                bs = int(rng.choice(space[7].categories))
+                dm = _adjust_dm(int(dm), int(nh), space[1].low, space[1].high)
+                cfg = TFTConfig(
+                    window=int(w),
+                    batch=bs,
+                    epochs=6,
+                    lr=lr,
+                    d_model=int(dm),
+                    nhead=int(nh),
+                    layers=int(ly),
+                    ff=int(ff),
+                    dropout=dr,
+                    topk=1,
+                    freq_window=50,
+                    entropy_window=50,
+                )
+                try:
+                    loss = _quick_tft_loss(df_recent, cfg, max_epochs=4)
+                except Exception:
+                    loss = 1e3
+                if loss < loc_loss:
+                    loc_loss = loss
+                    loc_best = [w, dm, nh, ly, ff, dr, lr, bs]
+            return loc_best, loc_loss
+
+    best, best_loss = _run_search(space_coarse, n_coarse)
+
+    if best is not None:
+        b_w, b_dm, b_nh, b_ly, b_ff, b_dr, b_lr, b_bs = best
+        b_dm = _adjust_dm(int(b_dm), int(b_nh), space_coarse[1].low, space_coarse[1].high)
+        space_fine = [
+            Integer(max(8, int(b_w) - 4), min(28, int(b_w) + 4), name="window"),
+            Integer(max(64, int(b_dm) - 40), min(240, int(b_dm) + 40), name="d_model"),
+            Categorical([int(b_nh), 2, 4]),
+            Integer(max(1, int(b_ly) - 1), min(6, int(b_ly) + 1), name="layers"),
+            Integer(max(128, int(b_ff) - 100), min(480, int(b_ff) + 100), name="ff"),
+            Real(max(0.02, b_dr / 2), min(0.3, b_dr * 2), name="dropout"),
+            Real(max(1e-4, b_lr / 2), min(5e-3, b_lr * 2), prior="log-uniform", name="lr"),
+            Categorical([b_bs, 32, 64]),
+        ]
+        fine_res, fine_loss = _run_search(space_fine, n_fine)
+        if fine_res is not None and fine_loss < best_loss:
+            best, best_loss = fine_res, fine_loss
     best_params = {
         "window": best[0],
-        "d_model": best[1],
-        "nhead": best[2],
+        "d_model": int(_adjust_dm(int(best[1]), int(best[2]), space_coarse[1].low, space_coarse[1].high)),
+        "nhead": int(best[2]),
         "layers": best[3],
         "ff": best[4],
         "dropout": best[5],
@@ -366,6 +434,8 @@ def train_tft(
     resume: bool = True,
     fresh: bool = False,
 ):
+    if cfg.d_model % cfg.nhead != 0:
+        raise ValueError(f"d_model 必须能被 nhead 整除，当前 d_model={cfg.d_model}, nhead={cfg.nhead}")
     dataset = TFTDataset(df, window=cfg.window, freq_window=cfg.freq_window, entropy_window=cfg.entropy_window)
     if len(dataset) < 10:
         raise ValueError("样本不足，无法训练 TFT")

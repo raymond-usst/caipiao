@@ -16,7 +16,7 @@ import logging
 import pandas as pd
 from neuralforecast import NeuralForecast
 from neuralforecast.models import TimesNet
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import IterableDataset
 from .features import build_features
 import numpy as np
 import torch
@@ -88,37 +88,6 @@ class StreamingTimesNetDataset(IterableDataset):
         return sum(max(0, len(ts[ts["unique_id"] == uid]) - self.input_size) for uid in ["sum", "blue"])
 
 
-class StreamingTimesNetDataset(IterableDataset):
-    """
-    流式回测数据集，逐步产出历史序列与目标值（含外生特征）。
-    """
-
-    def __init__(self, df: pd.DataFrame, input_size: int):
-        self.df = df
-        self.input_size = input_size
-
-    def __iter__(self):
-        ts = _build_timeseries(self.df)
-        for uid in ["sum", "blue"]:
-            sub = ts[ts["unique_id"] == uid].reset_index(drop=True)
-            y = sub["y"].to_numpy()
-            feats = sub[FEAT_COLS].to_numpy()
-            for i in range(self.input_size, len(sub)):
-                hist_y = y[i - self.input_size : i]
-                hist_x = feats[i - self.input_size : i]
-                tgt = y[i]
-                yield (
-                    torch.tensor(hist_y, dtype=torch.float32),
-                    torch.tensor(hist_x, dtype=torch.float32),
-                    torch.tensor(tgt, dtype=torch.float32),
-                    uid,
-                )
-
-    def __len__(self):
-        ts = _build_timeseries(self.df)
-        return sum(max(0, len(ts[ts["unique_id"] == uid]) - self.input_size) for uid in ["sum", "blue"])
-
-
 def _softmax_from_value(val: float, max_num: int, temperature: float = 3.0):
     classes = np.arange(1, max_num + 1, dtype=float)
     logits = -((classes - val) / temperature) ** 2
@@ -159,71 +128,111 @@ def _timesnet_ckpt_path(save_dir: Path, cfg: TimesNetConfig) -> Path:
     return save_dir / f"{base}.pkl"
 
 
-def _eval_timesnet_loss(df: pd.DataFrame, cfg: TimesNetConfig, max_train: int = 200) -> float:
+def _eval_timesnet_loss(df: pd.DataFrame, cfg: TimesNetConfig, max_train: int = 200, trials: int = 2) -> float:
+    """
+    稳健评估：多次子采样取中位数；hidden_size 自动偶数化。
+    """
     df_recent = df.tail(max_train)
-    ts = _build_timeseries(df_recent)
-    val_size = max(cfg.valid_size, cfg.h, 2)
-    model = TimesNet(
-        input_size=cfg.input_size,
-        h=cfg.h,
-        hidden_size=cfg.hidden_size,
-        top_k=cfg.top_k,
-        dropout=cfg.dropout,
-        learning_rate=cfg.learning_rate,
-        max_steps=cfg.max_steps,
-        batch_size=cfg.batch_size,
-        random_seed=42,
-        early_stop_patience_steps=cfg.early_stop_patience_steps,
-        hist_exog_list=FEAT_COLS,
-    )
-    if hasattr(model, "trainer_kwargs"):
-        model.trainer_kwargs["logger"] = False
-        model.trainer_kwargs["enable_progress_bar"] = False
-        model.trainer_kwargs["enable_model_summary"] = False  # 屏蔽重复的模型摘要提示
-    nf = NeuralForecast(models=[model], freq="D")
-    nf.fit(ts, val_size=val_size)
-    fcst = nf.predict(ts)
-    mae = 0.0
-    count = 0
-    for uid in ["sum", "blue"]:
-        truth = ts[ts["unique_id"] == uid]["y"].iloc[-cfg.h :].to_numpy()
-        pred = fcst[fcst["unique_id"] == uid]["TimesNet"].iloc[-cfg.h :].to_numpy()
-        if len(truth) == len(pred):
-            mae += float((abs(truth - pred)).mean())
-            count += 1
-    if count == 0:
-        return 1e3
-    return mae / count
+    losses = []
+
+    def _even_cfg(c: TimesNetConfig) -> TimesNetConfig:
+        hid = c.hidden_size if c.hidden_size % 2 == 0 else c.hidden_size + 1
+        return TimesNetConfig(
+            input_size=c.input_size,
+            h=c.h,
+            hidden_size=hid,
+            top_k=c.top_k,
+            dropout=c.dropout,
+            learning_rate=c.learning_rate,
+            max_steps=c.max_steps,
+            batch_size=c.batch_size,
+            valid_size=c.valid_size,
+            early_stop_patience_steps=c.early_stop_patience_steps,
+        )
+
+    cfg = _even_cfg(cfg)
+
+    for _ in range(max(1, trials)):
+        ts = _build_timeseries(df_recent)
+        val_size = max(cfg.valid_size, cfg.h, 2)
+        model = TimesNet(
+            input_size=cfg.input_size,
+            h=cfg.h,
+            hidden_size=cfg.hidden_size,
+            top_k=cfg.top_k,
+            dropout=cfg.dropout,
+            learning_rate=cfg.learning_rate,
+            max_steps=cfg.max_steps,
+            batch_size=cfg.batch_size,
+            random_seed=42,
+            early_stop_patience_steps=cfg.early_stop_patience_steps,
+            hist_exog_list=FEAT_COLS,
+        )
+        if hasattr(model, "trainer_kwargs"):
+            model.trainer_kwargs["logger"] = False
+            model.trainer_kwargs["enable_progress_bar"] = False
+            model.trainer_kwargs["enable_model_summary"] = False  # 屏蔽重复的模型摘要提示
+        try:
+            nf = NeuralForecast(models=[model], freq="D")
+            nf.fit(ts, val_size=val_size)
+            fcst = nf.predict(ts)
+            mae = 0.0
+            count = 0
+            for uid in ["sum", "blue"]:
+                truth = ts[ts["unique_id"] == uid]["y"].iloc[-cfg.h :].to_numpy()
+                pred = fcst[fcst["unique_id"] == uid]["TimesNet"].iloc[-cfg.h :].to_numpy()
+                if len(truth) == len(pred):
+                    mae += float((abs(truth - pred)).mean())
+                    count += 1
+            losses.append(mae / count if count else 1e3)
+        except Exception:
+            losses.append(500.0)
+    return float(np.median(losses))
 
 
 def bayes_optimize_timesnet(
     df: pd.DataFrame,
     recent: int = 400,
-    n_iter: int = 6,
+    n_iter: int = 40,
     random_state: int = 42,
 ):
     try:
         from skopt import gp_minimize
         from skopt.space import Integer, Real, Categorical
+        from skopt.sampler import Sobol
     except Exception as e:
         raise ImportError("需要安装 scikit-optimize 以运行 TimesNet 贝叶斯调参") from e
 
-    df_recent = df if recent <= 0 else df.tail(max(recent, 150))
+    # 动态样本：固定在 220~320，减少长序列波动
+    if recent <= 0:
+        df_recent = df.tail(min(len(df), 320))
+    else:
+        df_recent = df.tail(max(220, min(recent, 320)))
     if len(df_recent) < 100:
         raise ValueError("样本不足，无法进行 TimesNet 贝叶斯调参")
 
+    # 离散化先验，降低搜索难度
     space = [
-        Integer(40, min(200, len(df_recent) - 5), name="input_size"),
-        Integer(32, 128, name="hidden_size"),
-        Integer(2, 8, name="top_k"),
-        Real(0.0, 0.3, name="dropout"),
-        Real(1e-4, 5e-3, prior="log-uniform", name="learning_rate"),
-        Integer(50, 200, name="max_steps"),
+        Categorical([120, 140, 160, 180, min(200, len(df_recent) - 5)], name="input_size"),
+        Categorical([72, 96, 112], name="hidden_size"),
+        Categorical([3, 4], name="top_k"),
+        Real(0.05, 0.15, name="dropout"),
+        Real(3e-4, 1.2e-3, prior="log-uniform", name="learning_rate"),
+        Integer(60, 110, name="max_steps"),
         Categorical([16, 32], name="batch_size"),
     ]
 
-    def objective(params):
+    fail_stats = {"fails": 0, "total": 0}
+
+    def _adjust_hidden(hid: int) -> int:
+        return int(hid if hid % 2 == 0 else hid + 1)
+
+    def _eval_with_mode(params, light: bool = False) -> float:
+        """light 模式用更短步数/更小窗口，降低单次失败惩罚；heavy 模式为正式评估。
+        引入 trimmed mean + std 惩罚，爆炸/失败软罚后重试一次。"""
         inp, hid, tk, dr, lr, ms, bs = params
+        hid = _adjust_hidden(hid)
+        tk = max(1, min(tk, hid // 4 if hid // 4 > 0 else 1))
         cfg = TimesNetConfig(
             input_size=inp,
             h=1,
@@ -234,31 +243,334 @@ def bayes_optimize_timesnet(
             max_steps=ms,
             batch_size=bs,
             valid_size=0.1,
-            early_stop_patience_steps=3,
+            early_stop_patience_steps=2,
         )
-        try:
-            loss = _eval_timesnet_loss(df_recent, cfg, max_train=recent)
-        except Exception:
-            return 1e3
-        return loss
+        losses = []
+        fails = 0
+        trials = 3 if light else 4
+        penalty = 200.0 if light else 220.0
+        for _ in range(trials):
+            try:
+                eval_cfg = cfg
+                eval_cfg.max_steps = min(cfg.max_steps, 70 if light else 110)
+                max_train = min(len(df_recent), 260 if light else 340)
+                loss = _eval_timesnet_loss(df_recent, eval_cfg, max_train=max_train)
+            except Exception:
+                # 爆炸/失败软罚；再追加一次重试机会
+                try:
+                    eval_cfg = cfg
+                    eval_cfg.max_steps = min(cfg.max_steps, 60 if light else 90)
+                    loss = _eval_timesnet_loss(df_recent, eval_cfg, max_train=min(len(df_recent), 220 if light else 280))
+                except Exception:
+                    loss = penalty
+                fails += 1
+            losses.append(loss)
+        fail_stats["fails"] += fails
+        fail_stats["total"] += trials
+        if len(losses) >= 3:
+            arr = np.sort(losses)
+            trimmed = arr[1:-1] if len(arr) > 3 else arr
+            med = float(np.median(trimmed))
+            std_part = float(np.std(trimmed))
+            smooth_loss = med + 0.3 * std_part
+        else:
+            smooth_loss = float(np.median(losses))
+        p_fail = fails / trials
+        return p_fail * penalty + (1 - p_fail) * smooth_loss
 
-    res = gp_minimize(
-        objective,
-        space,
-        n_calls=n_iter,
-        random_state=random_state,
-        verbose=False,
-    )
-    best = res.x
-    best_loss = float(res.fun)
+    # 优先使用 Optuna TPE，多保真：轻评估筛选，再对前若干进行重评
+    try:
+        import optuna
+        from optuna.study import StudyDirection
+
+        def _optuna_objective(trial: "optuna.Trial"):
+            fail_ratio = fail_stats["fails"] / fail_stats["total"] if fail_stats["total"] > 0 else 0.0
+            lr_low_eff = 2e-4 if fail_ratio >= 0.5 else space[4].low
+            lr_high_eff = 1.5e-3 if fail_ratio >= 0.5 else space[4].high
+            dr_high_eff = 0.12 if fail_ratio >= 0.5 else space[3].high
+
+            inp = trial.suggest_categorical("input_size", list(space[0].categories))
+            hid = _adjust_hidden(trial.suggest_categorical("hidden_size", list(space[1].categories)))
+            tk = trial.suggest_categorical("top_k", list(space[2].categories))
+            dr = trial.suggest_float("dropout", space[3].low, space[3].high)
+            dr = float(np.clip(dr, space[3].low, dr_high_eff))
+            lr = trial.suggest_float("learning_rate", space[4].low, space[4].high, log=True)
+            lr = float(np.clip(lr, lr_low_eff, lr_high_eff))
+            ms = trial.suggest_int("max_steps", space[5].low, space[5].high)
+            bs = trial.suggest_categorical("batch_size", list(space[6].categories))
+            return _eval_with_mode([inp, hid, tk, dr, lr, ms, bs], light=True)
+
+        study = optuna.create_study(direction=StudyDirection.MINIMIZE, sampler=optuna.samplers.TPESampler(seed=random_state))
+        tpe_trials = max(40, min(70, int(n_iter)))  # 再增试次，争取更好初筛
+        study.optimize(_optuna_objective, n_trials=tpe_trials, show_progress_bar=False)
+
+        # 取前3-8名做重评 + 多起点重启
+        topk = min(8, len(study.trials))
+        sorted_trials = sorted(study.trials, key=lambda t: t.value)[:topk]
+        best = None
+        best_loss = 1e9
+        seeds = [random_state + i * 101 for i in range(topk)]
+        # 连续失败放宽标志
+        fail_counts = 0
+        def _maybe_relax_bounds():
+            nonlocal space
+            # 放宽 lr 下界到 2e-4，上界到 1.5e-3；dropout 上界降到 0.12
+            space = [
+                space[0],
+                space[1],
+                space[2],
+                Real(0.05, 0.12, name="dropout"),
+                Real(2e-4, 1.5e-3, prior="log-uniform", name="learning_rate"),
+                space[5],
+                space[6],
+            ]
+
+        for t, sd in zip(sorted_trials, seeds):
+            p = t.params
+            cand = [
+                int(p["input_size"]),
+                _adjust_hidden(int(p["hidden_size"])),
+                int(p["top_k"]),
+                float(p["dropout"]),
+                float(p["learning_rate"]),
+                int(p["max_steps"]),
+                int(p["batch_size"]),
+            ]
+            # 根据失败率动态放宽/收紧 lr 和 dropout
+            fail_ratio = fail_stats["fails"] / fail_stats["total"] if fail_stats["total"] > 0 else 0.0
+            lr_low_eff = 2e-4 if fail_ratio >= 0.5 else space[4].low
+            lr_high_eff = 1.5e-3 if fail_ratio >= 0.5 else space[4].high
+            dr_high_eff = 0.12 if fail_ratio >= 0.5 else space[3].high
+            cand[3] = float(np.clip(cand[3], space[3].low, dr_high_eff))
+            cand[4] = float(np.clip(cand[4], lr_low_eff, lr_high_eff))
+            # 重评
+            loss = _eval_with_mode(cand, light=False)
+            if loss < best_loss:
+                best_loss = loss
+                best = cand
+            else:
+                fail_counts += 1
+                if fail_counts >= max(2, topk // 2):
+                    _maybe_relax_bounds()
+            # 多起点局部扰动子代
+            rng = np.random.default_rng(sd)
+            for _ in range(12):
+                loc_inp = int(rng.choice(space[0].categories))
+                loc_hid = _adjust_hidden(int(rng.choice(space[1].categories)))
+                loc_tk = int(rng.choice(space[2].categories))
+                loc_dr = float(np.clip(rng.normal(cand[3], 0.02), space[3].low, dr_high_eff))
+                loc_lr = float(np.clip(rng.normal(cand[4], cand[4] * 0.25), lr_low_eff, lr_high_eff))
+                loc_ms = int(np.clip(rng.integers(cand[5] - 10, cand[5] + 11), space[5].low, space[5].high))
+                loc_bs = int(rng.choice(space[6].categories))
+                loc_cand = [loc_inp, loc_hid, loc_tk, loc_dr, loc_lr, loc_ms, loc_bs]
+                loc_loss = _eval_with_mode(loc_cand, light=False)
+                if loc_loss < best_loss:
+                    best_loss = loc_loss
+                    best = loc_cand
+        hid_final = _adjust_hidden(int(best[1]))
+        tk_final = int(max(1, min(int(best[2]), hid_final // 4 if hid_final // 4 > 0 else 1)))
+        best_params = {
+            "input_size": int(best[0]),
+            "hidden_size": hid_final,
+            "top_k": tk_final,
+            "dropout": float(best[3]),
+            "learning_rate": float(best[4]),
+            "max_steps": int(best[5]),
+            "batch_size": int(best[6]),
+        }
+        return best_params, best_loss
+    except Exception:
+        # 如果 Optuna 不可用或失败，退回 skopt 流程
+        pass
+
+    n_calls = max(30, min(40, int(n_iter)))  # 默认 30~36，可扩到 40
+    n_coarse = max(10, int(n_calls * 0.4))
+    n_mid = max(10, int(n_calls * 0.35))
+    n_fine = max(10, n_calls - n_coarse - n_mid)
+
+    def _run_search(space, calls, seed):
+        try:
+            res = gp_minimize(
+                objective,
+                space,
+                n_calls=calls,
+                random_state=seed,
+                verbose=False,
+            )
+            return res.x, float(res.fun), None
+        except Exception:
+            rng = np.random.default_rng(seed)
+            loc_best = None
+            loc_loss = 1e9
+            losses_log: list[float] = []
+            samples = None  # 混合 Categorical，Sobol 难以适配，直接用随机采样
+            for idx in range(calls):
+                dim = space[0]
+                inp = int(rng.choice(dim.categories)) if hasattr(dim, "categories") else int(rng.integers(dim.low, dim.high + 1))
+                dim = space[1]
+                hid = int(rng.choice(dim.categories)) if hasattr(dim, "categories") else int(rng.integers(dim.low, dim.high + 1))
+                dim = space[2]
+                tk = int(rng.choice(dim.categories)) if hasattr(dim, "categories") else int(rng.integers(dim.low, dim.high + 1))
+                dim = space[3]
+                dr = float(rng.uniform(dim.low, dim.high))
+                dim = space[4]
+                lr = float(np.exp(rng.uniform(np.log(dim.low), np.log(dim.high))))
+                dim = space[5]
+                ms = int(rng.integers(dim.low, dim.high + 1))
+                bs = int(rng.choice(space[6].categories))
+                hid = _adjust_hidden(int(hid))
+                tk = max(1, min(tk, hid // 4 if hid // 4 > 0 else 1))
+                cfg = TimesNetConfig(
+                    input_size=int(inp),
+                    h=1,
+                    hidden_size=int(hid),
+                    top_k=int(tk),
+                    dropout=dr,
+                    learning_rate=lr,
+                    max_steps=int(ms),
+                    batch_size=bs,
+                    valid_size=0.1,
+                    early_stop_patience_steps=2,
+                )
+                try:
+                    eval_cfg = cfg
+                    eval_cfg.max_steps = min(cfg.max_steps, 80)
+                    loss = _eval_timesnet_loss(df_recent, eval_cfg, max_train=min(len(df_recent), 300))
+                except Exception:
+                    loss = 500.0
+                losses_log.append(loss)
+                if loss < loc_loss:
+                    loc_loss = loss
+                    loc_best = [inp, hid, tk, dr, lr, ms, bs]
+            return loc_best, loc_loss, losses_log
+
+    best, best_loss, coarse_log = _run_search(space, n_coarse, seed=random_state)
+    if coarse_log and len(coarse_log) >= 3:
+        tail = coarse_log[-max(3, len(coarse_log) // 3):]
+        if np.std(tail) > 50:
+            extra_calls = max(4, int(n_coarse * 0.2))
+            extra_res, extra_loss, _ = _run_search(space, extra_calls, seed=random_state + 99)
+            if extra_res is not None and extra_loss < best_loss:
+                best, best_loss = extra_res, extra_loss
+
+    # Mid stage
+    if best is not None:
+        b_inp, b_hid, b_tk, b_dr, b_lr, b_ms, b_bs = best
+        b_hid = _adjust_hidden(int(b_hid))
+        space_mid = [
+            Integer(max(80, int(b_inp) - 30), min(int(b_inp) + 30, len(df_recent) - 5), name="input_size"),
+            Integer(max(60, int(b_hid) - 30), min(140, int(b_hid) + 30), name="hidden_size"),
+            Integer(max(2, int(b_tk) - 1), min(4, int(b_tk) + 1), name="top_k"),
+            Real(max(0.04, b_dr / 1.5), min(0.15, b_dr * 1.5), name="dropout"),
+            Real(max(3e-4, b_lr / 1.5), min(1.2e-3, b_lr * 1.5), prior="log-uniform", name="learning_rate"),
+            Integer(max(60, int(b_ms) - 25), min(120, int(b_ms) + 25), name="max_steps"),
+            Categorical([b_bs, 16, 32]),
+        ]
+        mid_res, mid_loss, mid_log = _run_search(space_mid, n_mid, seed=random_state + 1)
+        if mid_res is not None and mid_loss < best_loss:
+            best, best_loss = mid_res, mid_loss
+        if mid_log and len(mid_log) >= 3:
+            tail = mid_log[-max(3, len(mid_log) // 3):]
+            if np.std(tail) > 40:
+                extra_calls = max(4, int(n_mid * 0.2))
+                extra_res, extra_loss, _ = _run_search(space_mid, extra_calls, seed=random_state + 199)
+                if extra_res is not None and extra_loss < best_loss:
+                    best, best_loss = extra_res, extra_loss
+
+    # Fine stage
+    if best is not None:
+        b_inp, b_hid, b_tk, b_dr, b_lr, b_ms, b_bs = best
+        b_hid = _adjust_hidden(int(b_hid))
+        space_fine = [
+            Integer(max(85, int(b_inp) - 20), min(int(b_inp) + 20, len(df_recent) - 5), name="input_size"),
+            Integer(max(60, int(b_hid) - 20), min(140, int(b_hid) + 20), name="hidden_size"),
+            Integer(max(2, int(b_tk) - 1), min(4, int(b_tk) + 1), name="top_k"),
+            Real(max(0.045, b_dr / 1.3), min(0.14, b_dr * 1.3), name="dropout"),
+            Real(max(3e-4, b_lr / 1.3), min(1.1e-3, b_lr * 1.3), prior="log-uniform", name="learning_rate"),
+            Integer(max(60, int(b_ms) - 20), min(110, int(b_ms) + 20), name="max_steps"),
+            Categorical([b_bs, 16, 32]),
+        ]
+        fine_res, fine_loss, _ = _run_search(space_fine, n_fine, seed=random_state + 2)
+        if fine_res is not None and fine_loss < best_loss:
+            best, best_loss = fine_res, fine_loss
+
+    # Local refine around current best
+    def _local_refine(current_best, current_loss, seed):
+        if current_best is None:
+            return current_best, current_loss
+        rng = np.random.default_rng(seed)
+        inp, hid, tk, dr, lr, ms, bs = current_best
+        loc_best = current_best
+        loc_loss = current_loss
+        inp_choices = list(space[0].categories) if hasattr(space[0], "categories") else None
+        hid_choices = list(space[1].categories) if hasattr(space[1], "categories") else None
+        tk_choices = list(space[2].categories) if hasattr(space[2], "categories") else None
+        dr_low, dr_high = (space[3].low, space[3].high) if hasattr(space[3], "low") else (0.05, 0.15)
+        lr_low, lr_high = (space[4].low, space[4].high) if hasattr(space[4], "low") else (3e-4, 1.2e-3)
+        for _ in range(8):
+            cand_inp = int(rng.choice(inp_choices)) if inp_choices else int(np.clip(rng.integers(inp - 15, inp + 16), 90, 200))
+            cand_hid = _adjust_hidden(int(rng.choice(hid_choices))) if hid_choices else _adjust_hidden(int(np.clip(rng.integers(hid - 10, hid + 11), 64, 140)))
+            cand_tk = int(rng.choice(tk_choices)) if tk_choices else int(np.clip(rng.integers(max(2, tk - 1), tk + 2), 2, 4))
+            cand_dr = float(np.clip(rng.normal(dr, 0.02), dr_low, min(dr_high, 0.18)))
+            cand_lr = float(np.clip(rng.normal(lr, lr * 0.25), lr_low, 1.5e-3))
+            cand_ms = int(np.clip(rng.integers(ms - 15, ms + 16), 60, 120))
+            cand_bs = int(bs)
+            cfg = TimesNetConfig(
+                input_size=cand_inp,
+                h=1,
+                hidden_size=cand_hid,
+                top_k=max(1, min(cand_tk, cand_hid // 4 if cand_hid // 4 > 0 else 1)),
+                dropout=cand_dr,
+                learning_rate=cand_lr,
+                max_steps=cand_ms,
+                batch_size=cand_bs,
+                valid_size=0.1,
+                early_stop_patience_steps=2,
+            )
+            try:
+                eval_cfg = cfg
+                eval_cfg.max_steps = min(cfg.max_steps, 100)
+                loss = _eval_timesnet_loss(df_recent, eval_cfg, max_train=min(len(df_recent), 320))
+            except Exception:
+                loss = 250.0
+            if loss < loc_loss:
+                loc_loss = loss
+                loc_best = [
+                    cand_inp,
+                    cand_hid,
+                    cand_tk,
+                    cand_dr,
+                    cand_lr,
+                    cand_ms,
+                    cand_bs,
+                ]
+        return loc_best, loc_loss
+
+    best, best_loss = _local_refine(best, best_loss, seed=random_state + 333)
+
+    # 兜底：若仍高loss，回退保守参数
+    if best is None or best_loss >= 400:
+        best = [
+            min(140, max(100, len(df_recent) // 2)),
+            _adjust_hidden(96),
+            3,
+            0.08,
+            6e-4,
+            90,
+            16,
+        ]
+        best_loss = float(best_loss if best_loss is not None else 500.0)
+
+    hid_final = _adjust_hidden(int(best[1]))
+    tk_final = int(max(1, min(int(best[2]), hid_final // 4 if hid_final // 4 > 0 else 1)))
     best_params = {
-        "input_size": best[0],
-        "hidden_size": best[1],
-        "top_k": best[2],
-        "dropout": best[3],
-        "learning_rate": best[4],
-        "max_steps": best[5],
-        "batch_size": best[6],
+        "input_size": int(best[0]),
+        "hidden_size": hid_final,
+        "top_k": tk_final,
+        "dropout": float(best[3]),
+        "learning_rate": float(best[4]),
+        "max_steps": int(best[5]),
+        "batch_size": int(best[6]),
     }
     return best_params, best_loss
 
@@ -270,6 +582,20 @@ def train_timesnet(
     resume: bool = True,
     fresh: bool = False,
 ):
+    # 确保 hidden_size 为偶数，避免位置编码 shape 错误
+    if cfg.hidden_size % 2 != 0:
+        cfg = TimesNetConfig(
+            input_size=cfg.input_size,
+            h=cfg.h,
+            hidden_size=cfg.hidden_size + 1,
+            top_k=cfg.top_k,
+            dropout=cfg.dropout,
+            learning_rate=cfg.learning_rate,
+            max_steps=cfg.max_steps,
+            batch_size=cfg.batch_size,
+            valid_size=cfg.valid_size,
+            early_stop_patience_steps=cfg.early_stop_patience_steps,
+        )
     ts = _build_timeseries(df)
     val_size = max(cfg.valid_size, cfg.h)
     ckpt_path = None
@@ -351,138 +677,4 @@ def backtest_timesnet_model(
             continue
     blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
     return {"blue_top1": blue_hit, "samples": len(blue_hits)}
-
-
-class StreamingTimesNetDataset(IterableDataset):
-    """
-    流式回测数据集：按窗口构造 sum/blue 目标与特征。
-    """
-
-    def __init__(self, df: pd.DataFrame, cfg: TimesNetConfig):
-        self.df = df
-        self.cfg = cfg
-        self.window = cfg.input_size
-        self.feats = build_features(df)
-
-    def __iter__(self):
-        cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
-        data = self.df[cols].to_numpy(dtype=int)
-        for i in range(self.window, len(data)):
-            hist = data[i - self.window : i]
-            tgt_sum = hist[-1, :].sum()
-            tgt_blue = hist[-1, -1]
-            exog = self.feats.iloc[i - self.window : i].to_numpy(dtype=float)
-            yield (
-                torch.tensor(hist, dtype=torch.float32),
-                torch.tensor(tgt_sum, dtype=torch.float32),
-                torch.tensor(tgt_blue, dtype=torch.float32),
-                torch.tensor(exog, dtype=torch.float32),
-            )
-
-    def __len__(self):
-        return max(0, len(self.df) - self.window)
-
-
-def backtest_timesnet_model(
-    cfg: TimesNetConfig,
-    df: pd.DataFrame,
-    batch_size: int = 128,
-) -> Dict[str, float]:
-    """
-    大规模回测：使用流式数据集，简化评估和值 MAE 与蓝球命中。
-    """
-    dataset = StreamingTimesNetDataset(df, cfg)
-    loader = DataLoader(dataset, batch_size=batch_size)
-    ts = _build_timeseries(df)
-    val_size = max(cfg.valid_size, cfg.h)
-    model = TimesNet(
-        input_size=cfg.input_size,
-        h=cfg.h,
-        hidden_size=cfg.hidden_size,
-        top_k=cfg.top_k,
-        dropout=cfg.dropout,
-        learning_rate=cfg.learning_rate,
-        max_steps=max(50, min(cfg.max_steps, 200)),
-        batch_size=cfg.batch_size,
-        random_seed=42,
-        early_stop_patience_steps=cfg.early_stop_patience_steps,
-        hist_exog_list=FEAT_COLS,
-    )
-    if hasattr(model, "trainer_kwargs"):
-        model.trainer_kwargs["logger"] = False
-        model.trainer_kwargs["enable_progress_bar"] = False
-        model.trainer_kwargs["enable_model_summary"] = False
-    nf = NeuralForecast(models=[model], freq="D")
-    nf.fit(ts, val_size=val_size)
-
-    sum_mae = []
-    blue_acc = []
-    fcst_full = nf.predict(ts)
-    sum_pred = fcst_full[fcst_full["unique_id"] == "sum"]["TimesNet"].to_numpy()
-    blue_pred = fcst_full[fcst_full["unique_id"] == "blue"]["TimesNet"].to_numpy()
-    sums_true = ts[ts["unique_id"] == "sum"]["y"].to_numpy()
-    blues_true = ts[ts["unique_id"] == "blue"]["y"].to_numpy()
-    min_len = min(len(sum_pred), len(sums_true), len(blue_pred), len(blues_true))
-    if min_len > 0:
-        sum_mae.append(float(np.abs(sum_pred[-min_len:] - sums_true[-min_len:]).mean()))
-        blue_acc.append(float((np.round(blue_pred[-min_len:]) == blues_true[-min_len:]).mean()))
-    return {
-        "sum_mae": float(np.mean(sum_mae)) if sum_mae else float("inf"),
-        "blue_acc": float(np.mean(blue_acc)) if blue_acc else 0.0,
-        "samples": len(dataset),
-    }
-
-
-def backtest_timesnet_model(
-    nf: NeuralForecast,
-    cfg: TimesNetConfig,
-    df: pd.DataFrame,
-) -> Dict[str, float]:
-    """
-    使用全量预测结果计算 sum/blue MAE（流式数据集已准备好，但 TimesNet 预测接口一次性）。
-    """
-    ts = _build_timeseries(df)
-    fcst = nf.predict(ts)
-    pred_sum = fcst[fcst["unique_id"] == "sum"]["TimesNet"].to_numpy()
-    pred_blue = fcst[fcst["unique_id"] == "blue"]["TimesNet"].to_numpy()
-    y_sum = ts[ts["unique_id"] == "sum"]["y"].to_numpy()
-    y_blue = ts[ts["unique_id"] == "blue"]["y"].to_numpy()
-    min_len_sum = min(len(pred_sum), len(y_sum))
-    min_len_blue = min(len(pred_blue), len(y_blue))
-    mae_sum = float(np.mean(np.abs(pred_sum[-min_len_sum:] - y_sum[-min_len_sum:]))) if min_len_sum else float("inf")
-    mae_blue = float(np.mean(np.abs(pred_blue[-min_len_blue:] - y_blue[-min_len_blue:]))) if min_len_blue else float("inf")
-    return {"mae_sum": mae_sum, "mae_blue": mae_blue, "samples": len(ts) - cfg.input_size}
-
-
-def backtest_timesnet_model(
-    df: pd.DataFrame,
-    input_size: int,
-    batch_size: int = 128,
-) -> Dict[str, float]:
-    """
-    流式回测（简化）：使用历史频率近似 Top1，衡量基线命中。
-    注：TimesNet原生接口不便于逐批预测分类，此处提供轻量基准。
-    """
-    dataset = StreamingTimesNetDataset(df, input_size=input_size)
-    loader = DataLoader(dataset, batch_size=batch_size)
-
-    red_freq = np.bincount(df[["red1", "red2", "red3", "red4", "red5", "red6"]].to_numpy(dtype=int).ravel(), minlength=34)
-    red_top = np.argmax(red_freq[1:]) + 1
-    blue_freq = np.bincount(df["blue"].to_numpy(dtype=int), minlength=17)
-    blue_top = np.argmax(blue_freq[1:]) + 1
-
-    red_hits = []
-    blue_hits = []
-    for _, _, tgt, uid in loader:
-        tgt = tgt.numpy()
-        if uid[0] == "blue":
-            pred = blue_top
-            blue_hits.extend((pred == tgt).astype(float).tolist())
-        else:
-            pred = red_top
-            red_hits.extend((pred == tgt).astype(float).tolist())
-
-    red_hit = float(np.mean(red_hits)) if red_hits else 0.0
-    blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
-    return {"red_top1": red_hit, "blue_top1": blue_hit, "samples": len(dataset)}
 

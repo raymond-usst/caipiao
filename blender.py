@@ -9,8 +9,8 @@ import math
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import ElasticNet, LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split, StratifiedKFold, KFold
 from xgboost import XGBClassifier
 
 # 静默 sklearn 关于 multi_class 弃用的重复警告
@@ -405,8 +405,19 @@ def _stack_features(
 def _fit_meta_classifier(X: np.ndarray, y: np.ndarray, bayes: bool = False, n_iter: int = 8):
     if X.size == 0 or y.size == 0:
         raise ValueError("stacking 训练样本为空")
-    # 先 train/val 划分，用 LogisticRegression 作为稳健基线
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    # train/val 划分；若类别极端稀疏则不使用 stratify
+    _, counts_full = np.unique(y, return_counts=True)
+    use_stratify = counts_full.min() >= 2
+    X_train, X_val, y_train_raw, y_val_raw = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y if use_stratify else None
+    )
+    # 使用训练集拟合编码器，保证标签连续且与模型类别一致；验证集中未见标签直接过滤
+    le = LabelEncoder()
+    y_train = le.fit_transform(y_train_raw)
+    mask_val = np.isin(y_val_raw, le.classes_)
+    X_val = X_val[mask_val]
+    y_val_raw = y_val_raw[mask_val]
+    y_val = le.transform(y_val_raw)
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_val_s = scaler.transform(X_val)
@@ -422,6 +433,18 @@ def _fit_meta_classifier(X: np.ndarray, y: np.ndarray, bayes: bool = False, n_it
         verbosity=0,
     )
     best_model = base_model
+    n_iter = max(int(n_iter), 10)  # bayes 至少 10 次迭代
+    # 动态选择 CV：若最小类别不足 2，则使用 KFold，否则 StratifiedKFold
+    _, counts_full = np.unique(y_train, return_counts=True)
+    min_class = counts_full.min()
+    if min_class >= 2 and len(y_train) >= 3:
+        n_splits = min(3, int(min_class))
+        cv_obj = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    else:
+        n_splits = min(3, len(y_train))
+        n_splits = max(2, n_splits)
+        cv_obj = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+
     if bayes:
         try:
             from skopt import BayesSearchCV
@@ -430,7 +453,7 @@ def _fit_meta_classifier(X: np.ndarray, y: np.ndarray, bayes: bool = False, n_it
             search = BayesSearchCV(
                 estimator=base_model,
                 search_spaces={
-                    "n_estimators": Integer(100, 400),
+                    "n_estimators": Integer(120, 400),
                     "max_depth": Integer(3, 8),
                     "learning_rate": Real(1e-3, 0.3, prior="log-uniform"),
                     "subsample": Real(0.6, 1.0),
@@ -438,16 +461,39 @@ def _fit_meta_classifier(X: np.ndarray, y: np.ndarray, bayes: bool = False, n_it
                     "min_child_weight": Real(0.5, 5.0),
                 },
                 n_iter=n_iter,
-                cv=3,
+                cv=cv_obj,
                 random_state=42,
                 verbose=0,
             )
             search.fit(X_train_s, y_train)
             best_model = search.best_estimator_
         except Exception:
-            pass
+            # 兜底随机采样，避免调参失败直接退化
+            rng = np.random.default_rng(42)
+            best_score = 1e9
+            best_model = None
+            for _ in range(n_iter):
+                params = {
+                    "n_estimators": int(rng.integers(120, 401)),
+                    "max_depth": int(rng.integers(3, 9)),
+                    "learning_rate": float(np.exp(rng.uniform(np.log(1e-3), np.log(0.3)))),
+                    "subsample": float(rng.uniform(0.6, 1.0)),
+                    "colsample_bytree": float(rng.uniform(0.6, 1.0)),
+                    "min_child_weight": float(rng.uniform(0.5, 5.0)),
+                    "objective": "multi:softprob",
+                    "eval_metric": "mlogloss",
+                    "verbosity": 0,
+                }
+                model_try = XGBClassifier(**params)
+                model_try.fit(X_train_s, y_train)
+                score = float(model_try.score(X_val_s, y_val))
+                if score < best_score:
+                    best_score = score
+                    best_model = model_try
+            if best_model is None:
+                best_model = base_model
     best_model.fit(X_train_s, y_train)
-    return scaler, best_model
+    return scaler, best_model, le
 
 
 def train_stacking_blue(
@@ -457,8 +503,8 @@ def train_stacking_blue(
     n_iter: int = 6,
 ):
     X, y = _stack_features(df, base_predictors, target="blue")
-    scaler, model = _fit_meta_classifier(X, y, bayes=bayes, n_iter=n_iter)
-    return scaler, model
+    scaler, model, le = _fit_meta_classifier(X, y, bayes=bayes, n_iter=n_iter)
+    return scaler, model, le
 
 
 def predict_stacking_blue(
@@ -466,6 +512,7 @@ def predict_stacking_blue(
     base_predictors: List[Callable[[pd.DataFrame], Dict]],
     scaler,
     model,
+    le: LabelEncoder,
 ) -> Tuple[int, float]:
     # 使用全量历史生成特征预测下一期
     pred_vecs = []
@@ -480,8 +527,10 @@ def predict_stacking_blue(
     X = np.concatenate(pred_vecs).reshape(1, -1)
     Xs = scaler.transform(X)
     proba = model.predict_proba(Xs)[0]
+    classes = le.classes_
     top_idx = int(np.argmax(proba))
-    return top_idx + 1, float(proba[top_idx])
+    top_class = int(classes[top_idx])
+    return top_class + 1, float(proba[top_idx])
 
 
 def train_stacking_red(
@@ -492,14 +541,16 @@ def train_stacking_red(
 ):
     scalers = {}
     models = {}
+    label_encoders = {}
     for pos in range(1, 7):
         X, y = _stack_features(df, base_predictors, target="red", pos=pos)
         if X.size == 0:
             continue
-        scaler, model = _fit_meta_classifier(X, y, bayes=bayes, n_iter=n_iter)
+        scaler, model, le = _fit_meta_classifier(X, y, bayes=bayes, n_iter=n_iter)
         scalers[pos] = scaler
         models[pos] = model
-    return scalers, models
+        label_encoders[pos] = le
+    return scalers, models, label_encoders
 
 
 def predict_stacking_red(
@@ -507,6 +558,7 @@ def predict_stacking_red(
     base_predictors: List[Callable[[pd.DataFrame], Dict]],
     scalers: Dict[int, StandardScaler],
     models: Dict[int, LogisticRegression],
+    label_encoders: Dict[int, LabelEncoder],
     topk: int = 1,
 ) -> Dict[int, List[Tuple[int, float]]]:
     res: Dict[int, List[Tuple[int, float]]] = {}
@@ -528,8 +580,9 @@ def predict_stacking_red(
         scaler = scalers[pos]
         Xs = scaler.transform(X)
         proba = model.predict_proba(Xs)[0]
+        classes = label_encoders[pos].classes_
         top_idx = np.argsort(proba)[::-1][:topk]
-        res[pos] = [(int(i + 1), float(proba[i])) for i in top_idx]
+        res[pos] = [(int(classes[i] + 1), float(proba[i])) for i in top_idx]
     return res
 
 

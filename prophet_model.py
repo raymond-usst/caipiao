@@ -4,6 +4,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
 import pickle
+import os
+from pathlib import Path
+
+# 避免 Prophet/cmdstan 在受限环境下因并行或临时目录权限报错
+os.environ.setdefault("PROPHET_DISABLE_STAN_MULTIPROCESSING", "1")
+os.environ.setdefault("CMDSTANPY_FORCE_SERIAL", "1")
+os.environ.setdefault("PROPHET_DONT_LOG", "1")
+os.environ.setdefault("CMDSTANPY_VERBOSE", "0")
+_cmdstan_tmp = Path(".cmdstan_tmp")
+_cmdstan_tmp.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("CMDSTANPY_TMPDIR", str(_cmdstan_tmp.resolve()))
 
 import pandas as pd
 from prophet import Prophet
@@ -29,7 +40,8 @@ FEAT_COLS = [
 ]
 
 # 静默 prophet/cmdstanpy INFO
-logging.getLogger("cmdstanpy").setLevel(logging.ERROR)
+logging.getLogger("cmdstanpy").setLevel(logging.CRITICAL)
+logging.getLogger("cmdstanpy").propagate = False
 logging.getLogger("prophet").setLevel(logging.ERROR)
 
 def _build_series(df: pd.DataFrame, col: str, uid: str, feats: pd.DataFrame) -> pd.DataFrame:
@@ -64,9 +76,10 @@ def _eval_prophet_mae(df: pd.DataFrame, cfg: ProphetConfig, recent: int = 200) -
     # 留出最后1步做验证
     train_df = df_recent.iloc[:-1]
     val_df = df_recent.iloc[-1:]
-    models: Dict[str, Prophet] = {}
     mae = 0.0
     count = 0
+    # 使用单链优化，避免 cmdstanpy optimize 参数不支持 chains/cores/verbose
+    fit_kwargs = {"iter": 800, "seed": 42}
     for uid, col in [("sum", "sum_val"), ("blue", "blue")]:
         if col == "sum_val":
             train_series = _build_series(
@@ -93,7 +106,7 @@ def _eval_prophet_mae(df: pd.DataFrame, cfg: ProphetConfig, recent: int = 200) -
         )
         for c in FEAT_COLS:
             m.add_regressor(c)
-        m.fit(train_series[["ds", "y", *FEAT_COLS]])
+        m.fit(train_series[["ds", "y", *FEAT_COLS]], **fit_kwargs)
         future_df = val_series[["ds", *FEAT_COLS]]
         yhat = m.predict(future_df)["yhat"].to_numpy()
         truth = val_series["y"].to_numpy()
@@ -108,7 +121,7 @@ def _eval_prophet_mae(df: pd.DataFrame, cfg: ProphetConfig, recent: int = 200) -
 def bayes_optimize_prophet(
     df: pd.DataFrame,
     recent: int = 200,
-    n_iter: int = 6,
+    n_iter: int = 15,
     random_state: int = 42,
 ):
     try:
@@ -118,8 +131,8 @@ def bayes_optimize_prophet(
         raise ImportError("需要安装 scikit-optimize 以运行 Prophet 贝叶斯调参") from e
 
     space = [
-        Real(0.01, 0.5, prior="log-uniform", name="cps"),
-        Real(1.0, 20.0, prior="log-uniform", name="sps"),
+        Real(0.005, 0.5, prior="log-uniform", name="cps"),
+        Real(1.0, 30.0, prior="log-uniform", name="sps"),
     ]
 
     def objective(params):
@@ -138,15 +151,57 @@ def bayes_optimize_prophet(
             return 1e3
         return mae
 
-    res = gp_minimize(
-        objective,
-        space,
-        n_calls=n_iter,
-        random_state=random_state,
-        verbose=False,
-    )
-    cps, sps = res.x
-    best_mae = float(res.fun)
+    n_calls = max(int(n_iter), 12)  # skopt 要求至少 10 次迭代，略提升下限
+    n_coarse = max(6, n_calls // 2)
+    n_fine = max(6, n_calls - n_coarse)
+
+    def _run_search(space, calls):
+        try:
+            res = gp_minimize(
+                objective,
+                space,
+                n_calls=calls,
+                random_state=random_state,
+                verbose=False,
+            )
+            return res.x, float(res.fun)
+        except Exception:
+            rng = np.random.default_rng(random_state)
+            loc_best = None
+            loc_loss = 1e9
+            for _ in range(calls):
+                c = float(np.exp(rng.uniform(np.log(space[0].low), np.log(space[0].high))))
+                s = float(np.exp(rng.uniform(np.log(space[1].low), np.log(space[1].high))))
+                cfg = ProphetConfig(
+                    yearly_seasonality=True,
+                    weekly_seasonality=True,
+                    daily_seasonality=False,
+                    changepoint_prior_scale=c,
+                    seasonality_prior_scale=s,
+                )
+                try:
+                    target_df = df if recent <= 0 else df.tail(max(recent, 60))
+                    mae = _eval_prophet_mae(target_df, cfg, recent=recent if recent > 0 else len(target_df))
+                except Exception:
+                    mae = 1e3
+                if mae < loc_loss:
+                    loc_loss = mae
+                    loc_best = [c, s]
+            return loc_best, loc_loss
+
+    best, best_mae = _run_search(space, n_coarse)
+
+    if best is not None:
+        b_cps, b_sps = best
+        space_fine = [
+            Real(max(0.001, b_cps / 3), min(0.5, b_cps * 3), prior="log-uniform", name="cps"),
+            Real(max(1.0, b_sps / 3), min(30.0, b_sps * 3), prior="log-uniform", name="sps"),
+        ]
+        fine_res, fine_mae = _run_search(space_fine, n_fine)
+        if fine_res is not None and fine_mae < best_mae:
+            best = fine_res
+            best_mae = fine_mae
+    cps, sps = best
     best_params = {"changepoint_prior_scale": cps, "seasonality_prior_scale": sps}
     return best_params, best_mae
 
@@ -158,6 +213,7 @@ def train_prophet(
     resume: bool = True,
     fresh: bool = False,
 ):
+    fit_kwargs = {"iter": 1000, "seed": 42}
     feats = build_features(df)
     sum_df = _build_series(df.assign(sum_val=df[["red1", "red2", "red3", "red4", "red5", "red6", "blue"]].sum(axis=1)), "sum_val", "sum", feats)
     blue_df = _build_series(df, "blue", "blue", feats)
@@ -186,7 +242,7 @@ def train_prophet(
         )
         for c in FEAT_COLS:
             m.add_regressor(c)
-        m.fit(s_df[["ds", "y", *FEAT_COLS]])
+        m.fit(s_df[["ds", "y", *FEAT_COLS]], **fit_kwargs)
         models[uid] = m
     if ckpt_path is not None:
         with open(ckpt_path, "wb") as f:

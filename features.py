@@ -2,39 +2,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
 
-LARGE_PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31}
-
-
-def _ac_value(reds: np.ndarray) -> float:
-    """AC值（算术复杂度），简化为两两差分平均绝对值。"""
-    reds = np.sort(reds.astype(int))
-    diffs = []
-    for i in range(len(reds)):
-        for j in range(i + 1, len(reds)):
-            diffs.append(abs(reds[j] - reds[i]))
-    if not diffs:
-        return 0.0
-    return float(np.mean(diffs))
-
-
-def _parity_ratio(reds: np.ndarray) -> float:
-    odd = (reds % 2).sum()
-    return odd / len(reds)
-
-
-def _prime_ratio(reds: np.ndarray) -> float:
-    primes = sum(1 for r in reds if r in LARGE_PRIMES)
-    return primes / len(reds)
-
-
-def _big_ratio(reds: np.ndarray) -> float:
-    big = sum(1 for r in reds if r > 16)
-    return big / len(reds)
+LARGE_PRIMES = np.array([2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31], dtype=int)
 
 
 def _lunar_parts(series: pd.Series) -> pd.DataFrame:
@@ -43,17 +17,31 @@ def _lunar_parts(series: pd.Series) -> pd.DataFrame:
         from lunardate import LunarDate
     except Exception:
         return pd.DataFrame({"lunar_month": 0, "lunar_day": 0}, index=series.index)
-    months = []
-    days = []
-    for dt in pd.to_datetime(series):
+
+    @lru_cache(maxsize=4096)
+    def _solar_to_lunar(y: int, m: int, d: int) -> tuple[int, int]:
         try:
-            ld = LunarDate.fromSolarDate(dt.year, dt.month, dt.day)
-            months.append(ld.month)
-            days.append(ld.day)
+            ld = LunarDate.fromSolarDate(y, m, d)
+            return ld.month, ld.day
         except Exception:
-            months.append(0)
-            days.append(0)
+            return 0, 0
+
+    dts = pd.to_datetime(series)
+    months = np.empty(len(dts), dtype=int)
+    days = np.empty(len(dts), dtype=int)
+    for i, dt in enumerate(dts):
+        months[i], days[i] = _solar_to_lunar(dt.year, dt.month, dt.day)
+
     return pd.DataFrame({"lunar_month": months, "lunar_day": days}, index=series.index)
+
+
+def _ac_values(reds_all: np.ndarray) -> np.ndarray:
+    """向量化计算 AC（两两差分平均绝对值）。"""
+    # reds_all: [N, 6]
+    diffs = np.abs(reds_all[:, :, None] - reds_all[:, None, :])  # [N,6,6]
+    iu = np.triu_indices(6, k=1)
+    pairwise = diffs[:, iu[0], iu[1]]  # [N, 15]
+    return pairwise.mean(axis=1)
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -71,52 +59,34 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     reds_all = data[:, :6]
     blue_all = data[:, 6]
 
-    ac_list = []
-    span_list = []
-    sum_tail = []
-    odd_ratio = []
-    prime_ratio = []
-    big_ratio = []
-    for reds in reds_all:
-        ac_list.append(_ac_value(reds))
-        span_list.append(int(reds.max() - reds.min()))
-        s = int(reds.sum() + reds[-1])
-        sum_tail.append(s % 10)
-        odd_ratio.append(_parity_ratio(reds))
-        prime_ratio.append(_prime_ratio(reds))
-        big_ratio.append(_big_ratio(reds))
-
-    res["ac"] = ac_list
-    res["span"] = span_list
-    res["sum_tail"] = sum_tail
-    res["odd_ratio"] = odd_ratio
-    res["prime_ratio"] = prime_ratio
-    res["big_ratio"] = big_ratio
+    # 向量化宏观特征
+    res["ac"] = _ac_values(reds_all)
+    res["span"] = reds_all.max(axis=1) - reds_all.min(axis=1)
+    res["sum_tail"] = (reds_all.sum(axis=1) + blue_all) % 10
+    res["odd_ratio"] = (reds_all % 2).sum(axis=1) / 6.0
+    res["prime_ratio"] = np.isin(reds_all, LARGE_PRIMES).sum(axis=1) / 6.0
+    res["big_ratio"] = (reds_all > 16).sum(axis=1) / 6.0
 
     # 遗漏：简化为当前期的红球均值遗漏、最大遗漏；蓝球当前遗漏
-    # 计算红球遗漏
-    red_omit = {n: -1 for n in range(1, 34)}
-    omit_mean = []
-    omit_max = []
-    for reds in reds_all:
-        for n in red_omit:
-            red_omit[n] += 1
-        for r in reds:
-            red_omit[r] = 0
-        vals = list(red_omit.values())
-        omit_mean.append(float(np.mean(vals)))
-        omit_max.append(int(np.max(vals)))
+    # 计算红球遗漏（逐期累积，但用 numpy 数组避免 DataFrame 逐行循环）
+    red_last = np.full(33, -1, dtype=int)  # index 0 对应号码 1
+    omit_mean = np.empty(len(df), dtype=float)
+    omit_max = np.empty(len(df), dtype=int)
+    for i, reds in enumerate(reds_all):
+        red_last += 1
+        red_last[reds - 1] = 0
+        omit_mean[i] = red_last.mean()
+        omit_max[i] = red_last.max()
     res["omit_red_mean"] = omit_mean
     res["omit_red_max"] = omit_max
 
     # 蓝球遗漏
-    blue_omit = {n: -1 for n in range(1, 17)}
-    omit_blue = []
-    for b in blue_all:
-        for n in blue_omit:
-            blue_omit[n] += 1
-        blue_omit[b] = 0
-        omit_blue.append(int(blue_omit[b]))
+    blue_last = np.full(16, -1, dtype=int)
+    omit_blue = np.empty(len(df), dtype=int)
+    for i, b in enumerate(blue_all):
+        blue_last += 1
+        blue_last[b - 1] = 0
+        omit_blue[i] = blue_last[b - 1]
     res["omit_blue"] = omit_blue
 
     # 星期特征

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 import pickle
 
 import os
@@ -18,11 +18,8 @@ import pandas as pd
 import torch
 from neuralforecast import NeuralForecast
 from neuralforecast.models import NHITS
-from torch.utils.data import IterableDataset, DataLoader
-import torch
+from torch.utils.data import IterableDataset
 
-from .features import build_features
-from torch.utils.data import IterableDataset, DataLoader
 from .features import build_features
 
 FEAT_COLS = [
@@ -96,35 +93,36 @@ def backtest_nhits_model(
     nf: NeuralForecast,
     cfg: NHitsConfig,
     df: pd.DataFrame,
-    batch_size: int = 256,
+    max_samples: int | None = None,
 ) -> Dict[str, float]:
     """
-    使用 StreamingNHITSDataset 做简单流式回测：
-      - 对 sum/blue 两个序列分别计算点预测 MAE。
-      - 不重新训练，仅依赖已训练 nf。
+    轻量回测：使用已训练 N-HiTS 计算和值/蓝球 MAE，并估计蓝球 Top1 命中率。
+    可选截断最近 max_samples 期，避免全量预测过慢。
     """
-    dataset = StreamingNHITSDataset(df, input_size=cfg.input_size)
-    loader = DataLoader(dataset, batch_size=batch_size)
-    sum_err = []
-    blue_err = []
     nf.eval() if hasattr(nf, "eval") else None
-    # 直接用 nf.predict 全量一次，便于对齐（轻量场景）
-    ts = _build_timeseries(df)
+    hist_df = df if not max_samples or max_samples <= 0 else df.tail(max_samples + cfg.input_size)
+    ts = _build_timeseries(hist_df)
     fcst = nf.predict(ts)
+
     pred_sum = fcst[fcst["unique_id"] == "sum"]["NHITS"].to_numpy()
     pred_blue = fcst[fcst["unique_id"] == "blue"]["NHITS"].to_numpy()
     y_sum = ts[ts["unique_id"] == "sum"]["y"].to_numpy()
     y_blue = ts[ts["unique_id"] == "blue"]["y"].to_numpy()
-    # 对齐尾部长度
+
     min_len_sum = min(len(pred_sum), len(y_sum))
     min_len_blue = min(len(pred_blue), len(y_blue))
-    if min_len_sum > cfg.h:
-        sum_err = np.abs(pred_sum[-min_len_sum:] - y_sum[-min_len_sum:]).tolist()
-    if min_len_blue > cfg.h:
-        blue_err = np.abs(pred_blue[-min_len_blue:] - y_blue[-min_len_blue:]).tolist()
-    mae_sum = float(np.mean(sum_err)) if sum_err else float("inf")
-    mae_blue = float(np.mean(blue_err)) if blue_err else float("inf")
-    return {"mae_sum": mae_sum, "mae_blue": mae_blue, "samples": len(dataset)}
+
+    mae_sum = float(np.mean(np.abs(pred_sum[-min_len_sum:] - y_sum[-min_len_sum:]))) if min_len_sum else float("inf")
+    mae_blue = float(np.mean(np.abs(pred_blue[-min_len_blue:] - y_blue[-min_len_blue:]))) if min_len_blue else float("inf")
+
+    blue_hits = []
+    for pred, true in zip(pred_blue[-min_len_blue:], y_blue[-min_len_blue:]):
+        probs = _softmax_from_value(float(pred), max_num=16, temperature=3.0)
+        top1 = max(probs, key=lambda x: x[1])[0]
+        blue_hits.append(1.0 if top1 == int(round(true)) else 0.0)
+    blue_top1 = float(np.mean(blue_hits)) if blue_hits else 0.0
+
+    return {"mae_sum": mae_sum, "mae_blue": mae_blue, "blue_top1": blue_top1, "samples": min_len_blue}
 
 
 def _softmax_from_value(val: float, max_num: int, temperature: float = 3.0):
@@ -172,44 +170,53 @@ def _nhits_ckpt_path(save_dir: Path, cfg: NHitsConfig) -> Path:
     return save_dir / f"{base}.pkl"
 
 
-def _eval_nhits_loss(df: pd.DataFrame, cfg: NHitsConfig, max_train: int = 150) -> float:
+def _eval_nhits_loss(df: pd.DataFrame, cfg: NHitsConfig, max_train: int = 150, trials: int = 2) -> float:
+    """
+    稳健评估：多次子采样取中位数，失败返回较大惩罚但不直接 1000。
+    """
+    losses = []
     df_recent = df.tail(max_train)
-    ts = _build_timeseries(df_recent)
-    val_size = max(cfg.valid_size, cfg.h, 2)
-    model = NHITS(
-        input_size=cfg.input_size,
-        h=cfg.h,
-        learning_rate=cfg.learning_rate,
-        max_steps=cfg.max_steps,
-        batch_size=cfg.batch_size,
-        random_seed=42,
-        early_stop_patience_steps=cfg.early_stop_patience_steps,
-        hist_exog_list=FEAT_COLS,
-    )
-    if hasattr(model, "trainer_kwargs"):
-        model.trainer_kwargs["logger"] = False
-        model.trainer_kwargs["enable_progress_bar"] = False
-    nf = NeuralForecast(models=[model], freq="D")
-    nf.fit(ts, val_size=val_size)
-    fcst = nf.predict(ts)
-    # 计算sum和blue的简单MAE
-    mae = 0.0
-    count = 0
-    for uid in ["sum", "blue"]:
-        truth = ts[ts["unique_id"] == uid]["y"].iloc[-cfg.h :].to_numpy()
-        pred = fcst[fcst["unique_id"] == uid]["NHITS"].iloc[-cfg.h :].to_numpy()
-        if len(truth) == len(pred):
-            mae += float(np.abs(truth - pred).mean())
-            count += 1
-    if count == 0:
-        return 1e3
-    return mae / count
+    for _ in range(max(1, trials)):
+        ts = _build_timeseries(df_recent)
+        val_size = max(cfg.valid_size, cfg.h, 2)
+        model = NHITS(
+            input_size=cfg.input_size,
+            h=cfg.h,
+            learning_rate=cfg.learning_rate,
+            max_steps=cfg.max_steps,
+            batch_size=cfg.batch_size,
+            random_seed=42,
+            early_stop_patience_steps=cfg.early_stop_patience_steps,
+            hist_exog_list=FEAT_COLS,
+        )
+        if hasattr(model, "trainer_kwargs"):
+            model.trainer_kwargs["logger"] = False
+            model.trainer_kwargs["enable_progress_bar"] = False
+        try:
+            nf = NeuralForecast(models=[model], freq="D")
+            nf.fit(ts, val_size=val_size)
+            fcst = nf.predict(ts)
+            mae = 0.0
+            count = 0
+            for uid in ["sum", "blue"]:
+                truth = ts[ts["unique_id"] == uid]["y"].iloc[-cfg.h :].to_numpy()
+                pred = fcst[fcst["unique_id"] == uid]["NHITS"].iloc[-cfg.h :].to_numpy()
+                if len(truth) == len(pred):
+                    mae += float(np.abs(truth - pred).mean())
+                    count += 1
+            if count == 0:
+                losses.append(1e3)
+            else:
+                losses.append(mae / count)
+        except Exception:
+            losses.append(500.0)
+    return float(np.median(losses))
 
 
 def bayes_optimize_nhits(
     df: pd.DataFrame,
     recent: int = 300,
-    n_iter: int = 6,
+    n_iter: int = 15,
     random_state: int = 42,
 ):
     try:
@@ -218,14 +225,18 @@ def bayes_optimize_nhits(
     except Exception as e:
         raise ImportError("需要安装 scikit-optimize 以运行 N-HiTS 贝叶斯调参") from e
 
-    df_recent = df if recent <= 0 else df.tail(max(recent, 120))
+    # 动态样本：至少 150 条，最多 600 条，避免过长评估波动
+    if recent <= 0:
+        df_recent = df.tail(min(len(df), 600))
+    else:
+        df_recent = df.tail(max(150, min(recent, 600)))
     if len(df_recent) < 80:
         raise ValueError("样本不足，无法进行 N-HiTS 贝叶斯调参")
 
-    space = [
-        Integer(30, min(150, len(df_recent) - 5), name="input_size"),
-        Real(1e-4, 5e-3, prior="log-uniform", name="learning_rate"),
-        Integer(30, 150, name="max_steps"),
+    space_coarse = [
+        Integer(60, min(180, len(df_recent) - 5), name="input_size"),
+        Real(1e-4, 3e-3, prior="log-uniform", name="learning_rate"),
+        Integer(40, 150, name="max_steps"),
         Categorical([16, 32], name="batch_size"),
     ]
 
@@ -238,28 +249,121 @@ def bayes_optimize_nhits(
             max_steps=ms,
             batch_size=bs,
             valid_size=0.1,
-            early_stop_patience_steps=3,
+            early_stop_patience_steps=2,
         )
-        try:
-            loss = _eval_nhits_loss(df_recent, cfg, max_train=recent)
-        except Exception:
-            return 1e3
-        return loss
+        losses = []
+        fails = 0
+        for _ in range(3):  # 稳健评估取中位数
+            try:
+                eval_cfg = cfg
+                eval_cfg.max_steps = min(cfg.max_steps, 100)
+                loss = _eval_nhits_loss(df_recent, eval_cfg, max_train=len(df_recent), trials=2)
+            except Exception:
+                loss = 1e3
+                fails += 1
+            losses.append(loss)
+        losses = sorted(losses)
+        med = losses[len(losses) // 2]
+        p_fail = fails / 3
+        return p_fail * 1000 + (1 - p_fail) * med
 
-    res = gp_minimize(
-        objective,
-        space,
-        n_calls=n_iter,
-        random_state=random_state,
-        verbose=False,
-    )
-    best = res.x
-    best_loss = float(res.fun)
+    d = 4
+    n_calls = max(10, min(40, int(4 * d), int(n_iter)))  # 动态 n_calls
+    n_coarse = max(6, n_calls // 3)
+    n_mid = max(6, n_calls // 3)
+    n_fine = max(6, n_calls - n_coarse - n_mid)
+
+    def _run_search(space, calls, seed):
+        try:
+            res = gp_minimize(
+                objective,
+                space,
+                n_calls=calls,
+                random_state=seed,
+                verbose=False,
+            )
+            return res.x, float(res.fun)
+        except Exception:
+            rng = np.random.default_rng(seed)
+            loc_best = None
+            loc_loss = 1e9
+            for _ in range(calls):
+                inp = rng.integers(space[0].low, space[0].high + 1)
+                lr = float(np.exp(rng.uniform(np.log(space[1].low), np.log(space[1].high))))
+                ms = rng.integers(space[2].low, space[2].high + 1)
+                bs = int(rng.choice(space[3].categories))
+                cfg = NHitsConfig(
+                    input_size=int(inp),
+                    h=1,
+                    learning_rate=lr,
+                    max_steps=int(ms),
+                    batch_size=bs,
+                    valid_size=0.1,
+                    early_stop_patience_steps=2,
+                )
+                try:
+                    eval_cfg = cfg
+                    eval_cfg.max_steps = min(cfg.max_steps, 100)
+                    loss = _eval_nhits_loss(df_recent, eval_cfg, max_train=len(df_recent), trials=2)
+                except Exception:
+                    loss = 1e3
+                if loss < loc_loss:
+                    loc_loss = loss
+                    loc_best = [inp, lr, ms, bs]
+            return loc_best, loc_loss
+
+    best, best_loss = _run_search(space_coarse, n_coarse, seed=random_state)
+
+    # Mid stage：围绕 coarse 最优自适应收缩
+    if best is not None:
+        b_inp, b_lr, b_ms, b_bs = best
+        space_mid = [
+            Integer(max(50, int(b_inp) - 40), min(int(b_inp) + 40, len(df_recent) - 5), name="input_size"),
+            Real(max(1e-5, b_lr / 3), min(3e-3, b_lr * 3), prior="log-uniform", name="learning_rate"),
+            Integer(max(30, int(b_ms) - 40), min(180, int(b_ms) + 40), name="max_steps"),
+            Categorical([b_bs, 16, 32]),
+        ]
+        mid_res, mid_loss = _run_search(space_mid, n_mid, seed=random_state + 1)
+        if mid_res is not None and mid_loss < best_loss:
+            best, best_loss = mid_res, mid_loss
+
+    # Fine stage：进一步收缩
+    if best is not None:
+        b_inp, b_lr, b_ms, b_bs = best
+        space_fine = [
+            Integer(max(40, int(b_inp) - 25), min(int(b_inp) + 25, len(df_recent) - 5), name="input_size"),
+            Real(max(1e-5, b_lr / 2), min(3e-3, b_lr * 2), prior="log-uniform", name="learning_rate"),
+            Integer(max(30, int(b_ms) - 25), min(180, int(b_ms) + 25), name="max_steps"),
+            Categorical([b_bs, 16, 32]),
+        ]
+        fine_res, fine_loss = _run_search(space_fine, n_fine, seed=random_state + 2)
+        if fine_res is not None and fine_loss < best_loss:
+            best, best_loss = fine_res, fine_loss
+
+    if best is None or best_loss >= 900:
+        best = [
+            max(60, len(df_recent) * 2 // 3),
+            1e-3,
+            100,
+            16,
+        ]
+        best_loss = float(1e3)
+
+    # 若仍无有效解，回退经验参数
+    if best is None or best_loss >= 900:
+        best = [
+            max(60, len(df_recent) * 2 // 3),
+            1e-3,
+            100,
+            16,
+        ]
+        best_loss = float(1e3)
+
     best_params = {
-        "input_size": best[0],
-        "learning_rate": best[1],
-        "max_steps": best[2],
-        "batch_size": best[3],
+        "input_size": int(best[0]),
+        "learning_rate": float(best[1]),
+        "max_steps": int(best[2]),
+        "batch_size": int(best[3]),
     }
     return best_params, best_loss
 
@@ -329,144 +433,4 @@ def predict_nhits(nf: NeuralForecast, cfg: NHitsConfig, df: pd.DataFrame) -> Dic
     }
 
 
-def backtest_nhits_model(
-    nf: NeuralForecast,
-    cfg: NHitsConfig,
-    df: pd.DataFrame,
-    max_samples: int = 300,
-) -> Dict[str, float]:
-    """
-    流式回测：逐步截取历史->预测下一期蓝球，统计 Top1 命中率。
-    不重新训练，仅用已训模型做滑动预测，样本数默认限制以控制耗时。
-    """
-    blue_hits = []
-    total = len(df)
-    start_idx = max(cfg.input_size, total - max_samples)
-    for i in range(start_idx, total - 1):
-        hist = df.iloc[: i + 1]  # 预测下一期即 i+1
-        ts = _build_timeseries(hist)
-        try:
-            fcst = nf.predict(ts)
-            blue_pred = float(fcst[fcst["unique_id"] == "blue"]["NHITS"].iloc[-1])
-            blue_probs = _softmax_from_value(blue_pred, max_num=16)
-            top1 = blue_probs[0][0]
-            true_b = int(df.iloc[i + 1]["blue"])
-            blue_hits.append(1.0 if top1 == true_b else 0.0)
-        except Exception:
-            continue
-    blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
-    return {"blue_top1": blue_hit, "samples": len(blue_hits)}
-
-
-class StreamingNHITSDataset(IterableDataset):
-    """
-    流式回测数据集：按窗口构造 sum/blue 目标与特征。
-    """
-
-    def __init__(self, df: pd.DataFrame, cfg: NHitsConfig):
-        self.df = df
-        self.cfg = cfg
-        self.window = cfg.input_size
-        self.feats = build_features(df)
-
-    def __iter__(self):
-        cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
-        data = self.df[cols].to_numpy(dtype=int)
-        for i in range(self.window, len(data)):
-            hist = data[i - self.window : i]
-            tgt_sum = hist[-1, :].sum()
-            tgt_blue = hist[-1, -1]
-            exog = self.feats.iloc[i - self.window : i].to_numpy(dtype=float)
-            yield (
-                torch.tensor(hist, dtype=torch.float32),
-                torch.tensor(tgt_sum, dtype=torch.float32),
-                torch.tensor(tgt_blue, dtype=torch.float32),
-                torch.tensor(exog, dtype=torch.float32),
-            )
-
-    def __len__(self):
-        return max(0, len(self.df) - self.window)
-
-
-def backtest_nhits_model(
-    cfg: NHitsConfig,
-    df: pd.DataFrame,
-    batch_size: int = 128,
-) -> Dict[str, float]:
-    """
-    大规模回测：使用流式数据集，简化评估和蓝球回归命中（取最接近的整数）。
-    """
-    dataset = StreamingNHITSDataset(df, cfg)
-    loader = DataLoader(dataset, batch_size=batch_size)
-    # 这里直接用最近训练好的模型：重新训练一个轻量模型用于评估
-    ts = _build_timeseries(df)
-    val_size = max(cfg.valid_size, cfg.h)
-    model = NHITS(
-        input_size=cfg.input_size,
-        h=cfg.h,
-        learning_rate=cfg.learning_rate,
-        max_steps=max(30, min(cfg.max_steps, 150)),
-        batch_size=cfg.batch_size,
-        random_seed=42,
-        early_stop_patience_steps=cfg.early_stop_patience_steps,
-        hist_exog_list=FEAT_COLS,
-    )
-    if hasattr(model, "trainer_kwargs"):
-        model.trainer_kwargs["logger"] = False
-        model.trainer_kwargs["enable_progress_bar"] = False
-        model.trainer_kwargs["enable_model_summary"] = False
-    nf = NeuralForecast(models=[model], freq="D")
-    nf.fit(ts, val_size=val_size)
-
-    sum_mae = []
-    blue_acc = []
-    fcst_full = nf.predict(ts)
-    # 简单地用预测序列对齐末尾
-    sum_pred = fcst_full[fcst_full["unique_id"] == "sum"]["NHITS"].to_numpy()
-    blue_pred = fcst_full[fcst_full["unique_id"] == "blue"]["NHITS"].to_numpy()
-    sums_true = ts[ts["unique_id"] == "sum"]["y"].to_numpy()
-    blues_true = ts[ts["unique_id"] == "blue"]["y"].to_numpy()
-    min_len = min(len(sum_pred), len(sums_true), len(blue_pred), len(blues_true))
-    if min_len > 0:
-        sum_mae.append(float(np.abs(sum_pred[-min_len:] - sums_true[-min_len:]).mean()))
-        blue_acc.append(float((np.round(blue_pred[-min_len:]) == blues_true[-min_len:]).mean()))
-    return {
-        "sum_mae": float(np.mean(sum_mae)) if sum_mae else float("inf"),
-        "blue_acc": float(np.mean(blue_acc)) if blue_acc else 0.0,
-        "samples": len(dataset),
-    }
-
-
-def backtest_nhits_model(
-    nf_builder: Callable[[], NeuralForecast],
-    cfg: NHitsConfig,
-    df: pd.DataFrame,
-    batch_size: int = 128,
-) -> Dict[str, float]:
-    """
-    大规模回测（流式）：使用 StreamingNHITSDataset，按 unique_id 分别拟合简单线性头计算 Top1 命中。
-    注：NeuralForecast 本身训练较重，此处仅用于快速离线评估，不重新训练。
-    """
-    dataset = StreamingNHITSDataset(df, input_size=cfg.input_size)
-    loader = DataLoader(dataset, batch_size=batch_size)
-
-    red_hits = []
-    blue_hits = []
-    # 这里直接用频率概率近似蓝球 Top1（NHITS 模型为回归，未直接给分类头）
-    red_freq = np.bincount(df[["red1", "red2", "red3", "red4", "red5", "red6"]].to_numpy(dtype=int).ravel(), minlength=34)
-    red_top = np.argmax(red_freq[1:]) + 1
-    blue_freq = np.bincount(df["blue"].to_numpy(dtype=int), minlength=17)
-    blue_top = np.argmax(blue_freq[1:]) + 1
-
-    for hist_y, hist_x, tgt, uid in loader:
-        tgt = tgt.numpy()
-        if uid[0] == "blue":
-            pred = blue_top
-            blue_hits.extend((pred == tgt).astype(float).tolist())
-        else:
-            pred = red_top
-            red_hits.extend((pred == tgt).astype(float).tolist())
-    red_hit = float(np.mean(red_hits)) if red_hits else 0.0
-    blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
-    return {"red_top1": red_hit, "blue_top1": blue_hit, "samples": len(dataset)}
 
