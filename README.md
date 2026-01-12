@@ -1,201 +1,133 @@
-# 双色球爬取、分析与多模型融合预测 / Double Color Ball Scraping, Analysis & Ensemble Forecasting
+# 🎱 Lottery AI - Advanced Prediction System / 双色球 AI 预测系统
 
-## 快速开始 / Quick Start
-- 安装依赖 / Install
-  ```bash
-  pip install -r requirements.txt
-  ```
-- 初始化数据 / Sync all history
-  ```bash
-  python main.py sync --db data/ssq.db
-  ```
-- 基础分析 / Analyze
-  ```bash
-  python main.py analyze --db data/ssq.db --recent 200
-  ```
-- 可视化 UI / Streamlit UI
-  ```bash
-  streamlit run app.py
-  ```
-- 预测（多模型+融合+stacking）/ Predict (multi-model + blend + stacking)
-  ```bash
-  python main.py predict --db data/ssq.db --recent 400 --window 10 --topk 3 \
-    --bayes-cat --bayes-seq --bayes-tft --bayes-nhits --bayes-timesnet --bayes-prophet \
-    --stack-bayes
-  ```
-  可选流式回测 / optional streaming backtest: `--seq-backtest --tft-backtest --nhits-backtest --timesnet-backtest`
+> **State-of-the-art Deep Learning & Machine Learning for Lottery Prediction**
+> **基于深度学习与机器学习的前沿彩票预测系统**
 
-## 全量高强度训练示例 / Full intensive run example
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+---
+
+## 📖 Introduction / 简介
+
+This project is a comprehensive AI-powered system designed to analyze and predict "Dual Color Ball" (Union Lotto) lottery numbers. It leverages a diverse ensemble of **Deep Learning**, **Statistical**, and **Chaos Theory** models to capture both linear patterns and non-linear chaotic dynamics in lottery data.
+
+本项目是一个综合性的 AI 智能系统，旨在分析和预测“双色球”彩票号码。它利用**深度学习**、**统计学**和**混沌理论**等多种模型集成，捕捉彩票数据中的线性规律与非线性混沌动态。
+
+Unlike traditional statistical tools, this system aims for **principled uncertainty quantification** and **adaptive learning** using advanced techniques like Population Based Training (PBT), Bayesian Neural Networks, and Meta-Learning.
+
+与传统统计工具不同，本系统追求**原理性的不确定性量化**和**自适应学习**，采用了基于群体的训练 (PBT)、贝叶斯神经网络和元学习等前沿技术。
+
+---
+
+## ✨ Key Features / 核心功能
+
+### 🧠 Advanced Modeling / 高级建模
+*   **Ensemble Learning (集成学习)**: Blends predictions from **10+ models** (CatBoost, Transformer, LSTM, DeepCross, TFT, Prophet, N-HiTS, TimesNet).
+*   **Graph Neural Networks (图神经网络)**: **GAT (Graph Attention Network)** to model co-occurrence relationships between numbers.
+*   **Reinforcement Learning (强化学习)**: Policy Gradient based agent optimizing directly for reward (hits).
+*   **Chaos Theory (混沌理论)**: **Echo State Networks (ESN)** and chaotic features (Lyapunov Exponent, Correlation Dimension).
+*   **Bayesian Inference (贝叶斯推断)**: **BNN (Bayesian Neural Network)** for epistemic uncertainty quantification.
+*   **Meta-Learning (元学习)**: MAML-style fast adaptation with **Regime Detection** for shifting data distributions.
+
+### ⚙️ Robust Engineering / 稳健工程
+*   **Population Based Training (PBT)**: Auto-tuning hyperparameters and evolving model populations during training.
+*   **Principled Uncertainty (不确定性)**: **Conformal Prediction** for guaranteed coverage intervals and **Calibration** (Temperature/Platt Scaling).
+*   **High Performance (高性能)**: **Polars** based feature engineering and **Numba** JIT acceleration.
+*   **Explainability (可解释性)**: **SHAP** values for feature importance analysis.
+
+### 📊 Visualization & Ops / 可视化与运维
+*   **Predictive Dashboard (预测仪表盘)**: Interactive **Streamlit** app for real-time analysis and training monitoring.
+*   **Prediction Audit (预测审计)**: Full audit trail of all predictions with timestamping.
+*   **Comprehensive Evaluation (全方位评估)**: Time-Series Cross-Validation and Proper Scoring Rules (Brier, CRPS).
+
+---
+
+## 🚀 Quick Start / 快速开始
+
+### 1. Installation / 安装
 ```bash
-python main.py predict --db data/ssq.db --recent 0 --window 20 --topk 3 \
-  --cat-fresh --cat-no-resume --bayes-cat --bayes-cat-calls 12 --bayes-cat-cv 3 \
-  --seq-fresh --seq-no-resume --bayes-seq --bayes-seq-calls 10 --bayes-seq-recent 0 --seq-backtest --seq-backtest-batch 128 \
-  --tft-fresh --tft-no-resume --bayes-tft --bayes-tft-calls 10 --bayes-tft-recent 0 --tft-backtest --tft-backtest-batch 128 \
-  --nhits-fresh --nhits-no-resume --bayes-nhits --bayes-nhits-calls 8 --bayes-nhits-recent 0 --nhits-backtest --nhits-backtest-samples 500 \
-  --timesnet-fresh --timesnet-no-resume --bayes-timesnet --bayes-timesnet-calls 8 --bayes-timesnet-recent 0 --timesnet-backtest --timesnet-backtest-samples 500 \
-  --prophet-fresh --prophet-no-resume --bayes-prophet --bayes-prophet-calls 8 --bayes-prophet-recent 0 \
-  --stack-bayes --stack-bayes-calls 8
+# Clone the repository / 克隆仓库
+git clone https://github.com/yourusername/lottery_ai.git
+cd lottery_ai
+
+# Install dependencies / 安装依赖
+pip install -r requirements.txt
 ```
 
-## 特性概览 / Features
-- 数据抓取与校验 / Data sync & validation：全量/增量拉取；入库前校验红 6 不重复且 1-33、蓝 1 且 1-16。
-- 分析 / Analytics：频率/冷热、卡方/游程、自相关、遗漏/周期、相空间、相关维数、FNN、RR/DET、Apriori。
-- 特征 / Features：AC 值、和值尾、跨度、奇偶/质合/大小比、遗漏、农历、周几等。
-- 模型 / Models（GPU 优先）：CatBoost、Transformer、TFT（多任务）、N-HiTS、TimesNet、Prophet；奇偶模型、和值标准差模型用于约束。
-- 融合与 stacking / Blending & stacking：动态加权融合；XGBoost 元模型（拼接各模型概率向量，支持贝叶斯调参）。
-- 约束与推荐 / Ticket constraints：高概率红/蓝 + 和值均值±预测标准差 + 奇偶预测生成复式；杀号阈值可配。
-- 回测 / Backtest：CatBoost/TFT 滚动验证；Transformer/TFT/N-HiTS/TimesNet 流式回测（IterableDataset）。
+### 2. Data Sync / 数据同步
+Fetch the latest lottery data from the internet.
+从互联网获取最新的彩票数据。
+```bash
+python cli.py sync
+```
 
-## 贝叶斯调参增强 / Bayesian tuning enhancements
-- 多阶段搜索（粗-中-细）、动态 n_calls、自适应空间收缩、随机/局部扰动兜底。
-- TimesNet 专项：离散化空间，Optuna TPE + 多保真评估（轻筛选+重评），trimmed mean + std 惩罚，爆炸软罚+重试，连续失败放宽 lr/dropout。
-- 评估稳健化：多次评估取中位/trimmed mean；失败用软惩罚替代 1000 哨兵，避免搜索停滞。
+### 3. Training / 训练模型
+Train all models in the ensemble (supports parallel execution).
+训练集成中的所有模型（支持并行执行）。
+```bash
+python cli.py train-all
+```
 
-## 目录 / Project layout
-- `main.py`：CLI、调度、融合/stacking、复式与杀号。
-- `lottery/scraper.py`：爬虫。
-- `lottery/database.py`：SQLite schema 与校验。
-- `lottery/analyzer.py`：统计/混沌/Apriori。
-- `lottery/ml_model.py`，`seq_model.py`，`tft_model.py`，`nhits_model.py`，`timesnet_model.py`，`prophet_model.py`：各模型训练与调参。
-- `lottery/blender.py`：融合、stacking、复式、杀号。
+### 4. Prediction / 预测
+Generate predictions for the next draw.
+生成下一期预测号码。
+```bash
+python cli.py predict
+```
 
-## 数据源 / Data sources
-- 主 / Primary：福彩官网 JSON（约 2013~今）  
-  `https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice`
-- 辅 / Secondary：500.com 历史页与分年段补齐 2003~2012  
-  `https://datachart.500.com/ssq/history/inc/history.php?start=0001&end=9999`
+### 5. Dashboard / 启动仪表盘
+Launch the interactive visualization interface.
+启动交互式可视化界面。
+```bash
+python cli.py dashboard
+```
 
-## 常用命令 / Useful commands
-- 同步 / Sync：`python main.py sync --db data/ssq.db`
-- 分析 / Analyze：`python main.py analyze --db data/ssq.db --recent 200`
-- 预测 / Predict：见上方示例；可调 `--recent --window --topk`
-- 单模型序列 / Single model seq：
-  ```bash
-  python main.py predict-seq --db data/ssq.db --recent 600 --window 20 --epochs 30 --topk 3
-  python main.py predict-tft --db data/ssq.db --recent 800 --window 20 --epochs 30 --topk 3
-  ```
-- 滚动验证 / Rolling CV：
-  ```bash
-  python main.py cv-cat --db data/ssq.db --recent 800 --train 300 --test 20 --step 20
-  python main.py cv-tft --db data/ssq.db --recent 800 --train 400 --test 40 --step 40
-  ```
-- UI：`streamlit run app.py`
+---
 
-## 注意 / Notes
-- 默认 SQLite 单机文件，可结合系统计划任务定时运行。
-- 遵守目标站 robots/频率要求，避免高频抓取。
-- GPU 环境优先，可根据资源调整 batch/steps 以平衡性能与耗时。
-# 双色球爬取、分析与多模型融合预测（含混沌指标）
+## 🧠 Model Zoo / 模型库
 
-## 快速开始
-1. 安装依赖（建议使用虚拟环境）：
-   ```bash
-   pip install -r requirements.txt
-   ```
-2. 初始化并同步全部历史数据：
-   ```bash
-   python main.py sync --db data/ssq.db
-   ```
-   首次会抓取全量历史数据，后续重复执行会自动增量更新。
-3. 运行分析：
-   ```bash
-   python main.py analyze --db data/ssq.db --recent 200
-   ```
-   `--recent` 可指定只分析最近 N 期。
-4. 运行可视化 UI（Streamlit）：
-   ```bash
-   streamlit run app.py
-   ```
-   页面提供一键同步、频率/显著热冷号、遗漏、自相关、统计检验与推荐可视化；分析期数输入 0 表示使用全量数据。
-5. 预测（多模型+融合+stacking+复式/杀号）：
-   ```bash
-   python main.py predict --db data/ssq.db --recent 400 --window 10 --topk 3 \
-     --bayes-cat --bayes-seq --bayes-tft --bayes-nhits --bayes-timesnet --bayes-prophet \
-     --stack-bayes
-   ```
-   - 可选流式回测：`--seq-backtest/--tft-backtest/--nhits-backtest/--timesnet-backtest`
-   - 输出：基础模型、融合、XGBoost stacking、奇偶预测、和值标准差、约束复式、杀号。
-6. 单模型序列预测：
-   ```bash
-   python main.py predict-seq --db data/ssq.db --recent 600 --window 20 --epochs 30 --topk 3
-   python main.py predict-tft --db data/ssq.db --recent 800 --window 20 --epochs 30 --topk 3
-   ```
-7. 滚动验证：
-   ```bash
-   python main.py cv-cat --db data/ssq.db --recent 800 --train 300 --test 20 --step 20
-   python main.py cv-tft --db data/ssq.db --recent 800 --train 400 --test 40 --step 40
-   ```
-8. 一键训练/调度：
-   ```bash
-   python main.py train-all --db data/ssq.db --sync --recent 800 \
-     --run-tft --run-nhits --run-prophet --run-timesnet --run-blend
-   ```
-9. UI 快捷：
-   ```bash
-   streamlit run app.py
-   ```
+| Model Type | Models Included | Description (CN) |
+|:---|:---|:---|
+| **Tree-Based** | `CatBoost` | Gradient boosting decision trees, handles categorical features well. / 梯度提升树，擅长处理分类特征。 |
+| **Sequence** | `Transformer`, `LSTM` | Captures long-term temporal dependencies. / 捕捉长期时间依赖关系。 |
+| **Time-Series** | `TFT`, `N-HiTS`, `TimesNet`, `Prophet` | Specialized operational research & forecasting models. / 专业的运筹学与预测模型。 |
+| **Graph** | `LotteryGNN` (GAT) | Models number co-occurrences as a graph. / 将号码共现关系建模为图结构。 |
+| **Chaos** | `ESN` (Echo State Network) | Reservoir computing for chaotic dynamics. / 用于混沌动态的储备池计算。 |
+| **Probabilistic** | `LotteryBNN` | Bayesian weights for uncertainty estimation. / 用于不确定性估计的贝叶斯权重。 |
+| **Adaptive** | `MetaLearning` | Detects regime shifts and fast-adapts. / 检测机制转换并快速适应。 |
+| **RL** | `PolicyGradient` | Optimizes directly for lottery reward rules. / 直接针对彩票奖励规则进行优化。 |
 
-## 功能概览
-- 数据与校验：全量/增量抓取；入库前校验红 6 不重复且 1-33，蓝 1 且 1-16。
-- 分析：频率/热冷、基础统计、卡方/游程、自相关、遗漏/周期、相空间、相关维数、FNN、RR/DET、Apriori。
-- 特征：AC 值、和值尾、跨度、奇偶/质合/大小比、遗漏、农历、周几等。
-- 预测模型（GPU 优先，含 FocalLoss/组合哈希等增强）：
-  - CatBoost 位置；Transformer；TFT（多任务：和值/奇偶/跨度）
-  - N-HiTS / TimesNet / Prophet（和值+蓝球）
-  - 奇偶模型（红球奇数个数）；和值标准差模型（用于约束）
-- 融合/stacking：
-  - 动态加权融合（蓝/红/和值）
-  - XGBoost 元模型（概率向量特征，支持贝叶斯调参）
-- 约束与推荐：
-  - 基于高概率红/蓝 + 和值均值±预测标准差 + 奇偶预测生成复式
-  - 杀号：概率 < 0.01% 的红/蓝
-- 回测：
-  - CatBoost/TFT 滚动验证
-  - Transformer/TFT/N-HiTS/TimesNet 流式回测（IterableDataset）
+---
 
-## 数据源
-- 主：福彩官网 JSON（约 2013~今） `https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice`
-- 辅：500.com 历史页与分年段补齐 2003~2012
+## 📂 Project Structure / 项目结构
 
-## 目录速览
-- `main.py`：CLI、调度、融合/stacking、复式与杀号
-- `lottery/scraper.py`：爬虫
-- `lottery/database.py`：Schema 与入库校验
-- `lottery/analyzer.py`：统计/混沌/Apriori
-- `lottery/ml_model.py` 等：CatBoost/Transformer/TFT/N-HiTS/TimesNet/Prophet
-- `lottery/odd_model.py`：奇偶数预测
-- `lottery/sum_model.py`：和值标准差预测
-- `lottery/blender.py`：融合、stacking、复式、杀号
+```
+lottery/
+├── cli.py               # Command Line Interface / 命令行入口
+├── dashboard.py         # Streamlit Dashboard / 仪表盘
+├── lottery/
+│   ├── engine/          # Core Engines (Trainer, Predictor) / 核心引擎
+│   ├── features.py      # Feature Engineering (Polars) / 特征工程
+│   ├── blender.py       # Model Fusion / 模型融合
+│   ├── *_model.py       # Individual Model Implementations / 各个模型实现
+│   ├── pbt.py           # Population Based Training / 基于群体的训练
+│   ├── conformal.py     # Conformal Prediction / 适形预测
+│   └── calibration.py   # Probability Calibration / 概率校准
+└── docs/                # Documentation / 文档
+```
 
-## 主要文件
-- `main.py`：命令行入口，包含 `sync` 与 `analyze` 子命令。
-- `lottery/scraper.py`：爬虫逻辑，默认从 500.com 历史页面解析全部开奖。
-- `lottery/database.py`：SQLite schema 与增量写入。
-- `lottery/analyzer.py`：概率统计与混沌指标计算。
+---
 
-## 数据源说明
-- 主数据源：福彩官网 JSON 接口 `https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice`，一次拉取近 2000 期（约 2013 年至今）。
-- 辅数据源：500.com 历史页 `https://datachart.500.com/ssq/history/inc/history.php?start=0001&end=9999`（2003-2009）以及分年段 `start=10001&end=10400` 等方式补齐 2010-2012。
-- 解析包含：期号、开奖日期、6 红 1 蓝、销量/奖池/一等奖注数与奖金（字段可能因数据源有所缺失）。
-- 若数据源结构变更，可在 `lottery/scraper.py` 中调整解析器。
+## ⚠️ Disclaimer / 免责声明
 
-## 混沌与概率分析概览
-- 频率与 Dirichlet 平滑：估计红球 1-33、蓝球 1-16 的平滑出现概率。
-- 冷热分析：输出近期窗口内的高频/低频号码。
-- 近似最大李雅普诺夫指数：基于开奖和数序列的相空间重构（Rosenstein 思路）估计混沌程度。
-- 熵与滑动窗口：评估短期随机性波动。
-- 基础统计与假设检验：均值/标准差、红蓝球均匀性卡方统计、和值序列游程检验（独立同分布检验的近似）。
-- 显著热/冷号标记：基于标准化残差（z≥2 / z≤-2）标出频率显著偏高或偏低的号码。
-- 自相关分析：输出和值序列的低阶自相关系数（lag 1-5），用于识别序列相关性。
-- 遗漏值分析：输出红/蓝球当前遗漏与历史最大遗漏，显示遗漏 Top3。
-- 遗漏周期性提示：统计号码出现的间隔序列，若间隔波动极小（低 CV 且极差不大）则提示可能存在“准时出现”模式。
-- 间隔统计输出：展示红/蓝球出现间隔 CV 最小的号码 Top5（含均值/标准差/最小/最大间隔），便于人工复核是否存在规律。
-- 相空间重构：基于和值序列，支持 2-6 维、τ 可调的相空间散点可视化（可用于观察混沌吸引子形态）。
-- 更严格的混沌检验：相关维数估计（简化 GP）、假最近邻比例 FNN、复现率/确定性(RR/DET) 指标。
-- Apriori 关联规则：基于红+蓝的事务集（蓝球以前缀区分），输出支持度/置信度/提升度最高的规则（默认 sup>=0.01, conf>=0.2）。
+**English**:
+This project is for **research and educational purposes only**. Lottery entails significant risk, and buying lottery tickets is a form of gambling. The predictions generated by this system are based on historical data and probabilistic models, which **cannot guarantee** winning results. The author assumes no responsibility for any financial losses incurred by using this software. Please play responsibly.
 
-## 注意
-- 程序默认使用 SQLite 单机文件，方便无服务部署。
-- 若需自动定时，可配合系统计划任务（Windows 任务计划、Linux cron）。
-- 请遵守目标站点的 robots 与抓取频率要求，避免高频请求。
+**中文**:
+本项目仅供**研究和教育用途**。彩票具有巨大的风险，购买彩票属于博彩行为。本系统生成的预测基于历史数据和概率模型，**不能保证**中奖。对于使用本软件造成的任何经济损失，作者不承担任何责任。请理性购彩，量力而行。
 
+---
+
+*Built with ❤️ by Deepmind Agentic AI*

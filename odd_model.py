@@ -139,3 +139,49 @@ def bayes_optimize_odd(
     best_score = float(search.best_score_)
     return best, best_score
 
+
+def random_optimize_odd(
+    df: pd.DataFrame,
+    window: int = 10,
+    samples: int = 20,
+    random_state: int = 42,
+) -> Tuple[Dict, float]:
+    """
+    随机搜索奇偶模型超参，适用于不想用贝叶斯或噪声较大的场景。
+    评估：顺序切分 80/20 做一次验证，指标用准确率。
+    """
+    X, y = _prepare_dataset(df, window=window)
+    if len(y) < 50:
+        raise ValueError("样本不足，无法进行奇偶比随机调参")
+    split = int(len(y) * 0.8)
+    X_train, y_train = X[:split], y[:split]
+    X_val, y_val = X[split:], y[split:]
+
+    rng = np.random.default_rng(random_state)
+    best = None
+    best_acc = -1.0
+    for _ in range(samples):
+        depth = int(rng.integers(4, 9))
+        lr = float(np.exp(rng.uniform(np.log(1e-3), np.log(0.3))))
+        it = int(rng.integers(80, 401))
+        model = CatBoostClassifier(
+            iterations=it,
+            depth=depth,
+            learning_rate=lr,
+            loss_function="MultiClass",
+            verbose=False,
+            task_type="GPU" if torch.cuda.is_available() else "CPU",
+        )
+        try:
+            model.fit(X_train, y_train)
+            proba = model.predict_proba(X_val)
+            pred = np.argmax(proba, axis=1)
+            acc = float((pred == y_val).mean())
+        except Exception:
+            acc = -1.0
+        if acc > best_acc:
+            best_acc = acc
+            best = {"depth": depth, "learning_rate": lr, "iterations": it}
+    if best is None:
+        raise RuntimeError("奇偶随机搜索未找到可行解")
+    return best, best_acc

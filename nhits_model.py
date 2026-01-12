@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
+from lottery.utils.logger import logger
+from lottery.engine.predictor import BasePredictor
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
@@ -21,6 +25,10 @@ from neuralforecast.models import NHITS
 from torch.utils.data import IterableDataset
 
 from .features import build_features
+from .pbt import ModelAdapter, Member
+import copy
+import random
+from typing import Any, Tuple
 
 FEAT_COLS = [
     "ac",
@@ -107,13 +115,22 @@ def backtest_nhits_model(
     pred_sum = fcst[fcst["unique_id"] == "sum"]["NHITS"].to_numpy()
     pred_blue = fcst[fcst["unique_id"] == "blue"]["NHITS"].to_numpy()
     y_sum = ts[ts["unique_id"] == "sum"]["y"].to_numpy()
-    y_blue = ts[ts["unique_id"] == "blue"]["y"].to_numpy()
-
+    y_blue = ts[ts["unique_id"] == "blue"]["y"].iloc[-len(pred_blue):].to_numpy()
+    
+    # Alignment: pred_blue is forecast for [T-h+1 ... T] or similar horizon
+    # Ensure we compare same length from end of array
     min_len_sum = min(len(pred_sum), len(y_sum))
+    # Align from the end
+    p_sum_aligned = pred_sum[-min_len_sum:]
+    y_sum_aligned = y_sum[-min_len_sum:]
+    
     min_len_blue = min(len(pred_blue), len(y_blue))
+    p_blue_aligned = pred_blue[-min_len_blue:]
+    y_blue_aligned = y_blue[-min_len_blue:]
 
-    mae_sum = float(np.mean(np.abs(pred_sum[-min_len_sum:] - y_sum[-min_len_sum:]))) if min_len_sum else float("inf")
-    mae_blue = float(np.mean(np.abs(pred_blue[-min_len_blue:] - y_blue[-min_len_blue:]))) if min_len_blue else float("inf")
+    mae_sum = float(np.mean(np.abs(p_sum_aligned - y_sum_aligned))) if min_len_sum else float("inf")
+    mae_blue = float(np.mean(np.abs(p_blue_aligned - y_blue_aligned))) if min_len_blue else float("inf")
+
 
     blue_hits = []
     for pred, true in zip(pred_blue[-min_len_blue:], y_blue[-min_len_blue:]):
@@ -431,6 +448,169 @@ def predict_nhits(nf: NeuralForecast, cfg: NHitsConfig, df: pd.DataFrame) -> Dic
         "blue_probs": blue_probs,
         "red_probs": red_probs,
     }
+
+
+class NHitsModelAdapter(ModelAdapter):
+    def train_step(self, member: Member, dataset: pd.DataFrame, steps: int) -> Tuple[Any, float]:
+        cfg = member.config
+        ts = _build_timeseries(dataset)
+        val_size = max(cfg.valid_size, cfg.h)
+        
+        if member.model_state is None:
+             models = [
+                NHITS(
+                    input_size=cfg.input_size,
+                    h=cfg.h,
+                    learning_rate=cfg.learning_rate,
+                    max_steps=cfg.max_steps, 
+                    batch_size=cfg.batch_size,
+                    random_seed=42,
+                    early_stop_patience_steps=cfg.early_stop_patience_steps,
+                    hist_exog_list=FEAT_COLS,
+                )
+            ]
+             nf = NeuralForecast(models=models, freq="D")
+        else:
+             nf = member.model_state
+             
+        # Increment max_steps for the model(s) inside
+        for m in nf.models:
+             m.max_steps += 50
+        
+        try:
+            nf.fit(ts, val_size=val_size)
+            
+            # Predict only for validation horizon
+            # To predict the last 'h' steps of 'ts' (which we treat as validation here)
+            # we should provide input up to T-h.
+            # But TS DataFrame is stacked.
+            # Let's filter by date?
+            dates = ts["ds"].unique()
+            dates.sort()
+            val_dates = dates[-cfg.h:]
+            cutoff_date = val_dates[0]
+            
+            # Input for prediction: all data BEFORE cutoff_date
+            ts_in = ts[ts["ds"] < cutoff_date]
+            
+            fcst = nf.predict(ts_in)
+            mae = 0.0
+            count = 0
+            for uid in ["sum", "blue"]:
+                 truth = ts[(ts["unique_id"] == uid) & (ts["ds"].isin(val_dates))]["y"].to_numpy()
+                 # fcst 'ds' align with val_dates?
+                 # fcst starts from last date of ts_in + 1.
+                 # ts_in ends at T-h. So fcst is T-h+1 ... T.
+                 # which matches val_dates.
+                 pred = fcst[fcst["unique_id"] == uid]["NHITS"].to_numpy()
+                 
+                 # Ensure length match
+                 min_len = min(len(truth), len(pred))
+                 if min_len > 0:
+                     mae += float(np.abs(truth[:min_len] - pred[:min_len]).mean())
+                     count += 1
+            loss = mae / count if count > 0 else 1000.0
+        except Exception as e:
+            print(f"NHits Train Step Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return nf, 0.0 # Return 0 loss to avoid crash, or high loss?
+        
+        return nf, -loss
+        
+        return nf, -loss 
+
+    def evaluate(self, member: Member, dataset: pd.DataFrame) -> float:
+        nf = member.model_state
+        if nf is None: return 0.0
+        # Check if fitted (handle potential training failure gracefully)
+        if not getattr(nf, "fitted", False):
+            # Try to infer from private attribute if 'fitted' property missing?
+            # Or just return 0.0
+            # Check if models inside are fitted?
+            # Assuming if fit() succeeded, fitted is True.
+            return 0.0
+            
+        cfg = member.config
+        
+        try:
+            res = backtest_nhits_model(nf, cfg, dataset, max_samples=60)
+            score = res["blue_top1"]
+        except Exception as e:
+            print(f"NHits Eval Error: {e}")
+            return 0.0
+        return score
+
+    def perturb_config(self, config: NHitsConfig) -> NHitsConfig:
+        new_cfg = copy.deepcopy(config)
+        factors = [0.8, 1.2]
+        if random.random() < 0.3:
+            new_cfg.learning_rate *= random.choice(factors)
+        return new_cfg
+
+    def save(self, member: Member, path: Path) -> None:
+        if member.model_state:
+            with open(path, "wb") as f:
+                pickle.dump(member.model_state, f)
+
+    def load(self, path: Path) -> Member:
+        pass
+
+
+class NHitsPredictor(BasePredictor):
+    def __init__(self, config):
+        super().__init__(config)
+        self.cfg = NHitsConfig(
+            input_size=config.input_size,
+            h=1,
+            n_layers=config.n_layers,
+            n_blocks=config.n_blocks,
+            learning_rate=config.learning_rate,
+            max_steps=config.max_steps,
+            batch_size=32,
+            valid_size=0.1
+        )
+        self.model = None
+
+    def train(self, df: pd.DataFrame) -> None:
+        logger.info(f"Training NHits (size={self.cfg.input_size})...")
+        self.model, self.cfg = train_nhits(
+            df,
+            self.cfg,
+            save_dir="models/NHits",
+            resume=self.cfg.resume,
+            fresh=self.cfg.fresh
+        )
+
+    def predict(self, df: pd.DataFrame) -> Dict[str, Any]:
+        if self.model is None:
+            raise RuntimeError("NHits model not trained or loaded")
+        return predict_nhits(self.model, self.cfg, df)
+    
+    def save(self, save_dir: str) -> None:
+        path = Path(save_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        model_path = path / f"nhits_in{self.cfg.input_size}_{self.cfg.n_layers}l_{self.cfg.max_steps}s.pkl"
+        with open(model_path, "wb") as f:
+            pickle.dump(self.model, f)
+        logger.info(f"NHits model saved to {model_path}")
+
+    def load(self, save_dir: str) -> bool:
+        path = Path(save_dir)
+        if not path.exists(): return False
+        
+        model_path = path / f"nhits_in{self.cfg.input_size}_{self.cfg.n_layers}l_{self.cfg.max_steps}s.pkl"
+        if not model_path.exists(): return False
+        
+        try:
+            with open(model_path, "rb") as f:
+                self.model = pickle.load(f)
+            logger.info(f"NHits model loaded from {model_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load NHits model: {e}")
+            return False
+
 
 
 

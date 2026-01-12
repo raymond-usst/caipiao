@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime
+from lottery.utils.logger import logger
+from lottery.engine.predictor import BasePredictor
+
 import math
+import copy
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple, List
@@ -13,6 +19,7 @@ from torch.utils.data import Dataset, DataLoader, IterableDataset
 from torch.optim import Adam
 from .features import build_features
 from .features import build_features
+from .pbt import ModelAdapter, Member
 
 
 PAD_ID = 0
@@ -32,8 +39,10 @@ def encode_draw(row: np.ndarray) -> List[int]:
 
 def combo_hash(reds: np.ndarray) -> int:
     """对排序后的红球组合做哈希，映射到固定桶."""
+    import zlib
     reds_sorted = tuple(sorted(int(x) for x in reds))
-    return hash(reds_sorted) % COMBO_VOCAB
+    # 使用 adler32 保证确定性
+    return zlib.adler32(str(reds_sorted).encode("utf-8")) % COMBO_VOCAB
 
 
 class DrawDataset(Dataset):
@@ -433,6 +442,96 @@ def train_seq_model(
         print(f"[Transformer] 模型已保存到 {ckpt_path}")
     return model, cfg
 
+class SeqModelAdapter(ModelAdapter):
+    def train_step(self, member: Member, dataset: pd.DataFrame, steps: int) -> Tuple[Any, float]:
+        cfg = member.config
+        # If model_state is None, initialize new model
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        if member.model_state is None:
+             model = SeqModel(
+                d_model=cfg.d_model,
+                nhead=cfg.nhead,
+                num_layers=cfg.num_layers,
+                dim_feedforward=cfg.ff,
+                dropout=cfg.dropout,
+            ).to(device)
+        else:
+            model = member.model_state.to(device)
+            model.train()
+            
+        ds = DrawDataset(dataset, window=cfg.window)
+        loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_batch)
+        opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+        
+        # Train for 'steps' epochs
+        model.train()
+        total_loss = 0.0
+        n_batches = 0
+        
+        # Since 'steps' in our simplified logic is "epochs", we iterate epochs
+        for _ in range(steps):
+             for src, tgt, combo, feats in loader:
+                src, tgt, combo, feats = src.to(device), tgt.to(device), combo.to(device), feats.to(device)
+                opt.zero_grad()
+                reds, blue = model(src, combo_ids=combo, feats=feats)
+                loss = _focal_loss(blue, tgt[:, -1] - BLUE_OFFSET - 1)
+                for i, head_out in enumerate(reds):
+                    loss = loss + _focal_loss(head_out, tgt[:, i] - 1)
+                loss.backward()
+                opt.step()
+                total_loss += loss.item()
+                n_batches += 1
+                
+        avg_loss = total_loss / max(1, n_batches)
+        # Return state on CPU to save GPU memory during population management
+        return model.cpu(), avg_loss
+
+    def evaluate(self, member: Member, dataset: pd.DataFrame) -> float:
+        # Evaluate using backtest style (accuracy) on validation set (e.g. last 10%)
+        # For simplicity, using last 40 samples as 'validation'
+        cfg = member.config
+        model = member.model_state
+        if model is None: return 0.0
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        model.eval()
+        
+        # Use simple validation split
+        val_size = 40
+        if len(dataset) > val_size + cfg.window:
+             val_df = dataset.iloc[-val_size - cfg.window:]
+        else:
+             val_df = dataset
+             
+        res = backtest_seq_model(model, cfg, val_df, batch_size=cfg.batch_size)
+        # Score = Average of Red Top1 and Blue Top1
+        score = (res["red_top1"] + res["blue_top1"]) / 2
+        model.cpu()
+        return score
+
+    def perturb_config(self, config: TrainConfig) -> TrainConfig:
+        new_cfg = copy.deepcopy(config)
+        # Perturb with 1.2 or 0.8 factor randomly
+        factors = [0.8, 1.2]
+        
+        if random.random() < 0.3:
+            new_cfg.lr *= random.choice(factors)
+        if random.random() < 0.3:
+            new_cfg.dropout = max(0.01, min(0.5, new_cfg.dropout * random.choice([0.9, 1.1])))
+        if random.random() < 0.3:
+            new_cfg.batch_size = int(max(16, new_cfg.batch_size * random.choice(factors)))
+            
+        return new_cfg
+
+    def save(self, member: Member, path: Path) -> None:
+        if member.model_state:
+            torch.save(member.model_state.state_dict(), path)
+
+    def load(self, path: Path) -> Member:
+        raise NotImplementedError("Not strictly needed for basic PBT flow yet")
+
 
 def predict_seq(model: SeqModel, cfg: TrainConfig, df: pd.DataFrame) -> Dict:
     cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
@@ -494,4 +593,71 @@ def backtest_seq_model(
     red_hit = float(np.mean(red_hits)) if red_hits else 0.0
     blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
     return {"red_top1": red_hit, "blue_top1": blue_hit, "samples": len(dataset)}
+
+
+class SeqPredictor(BasePredictor):
+    def __init__(self, config):
+        super().__init__(config)
+        self.cfg = TrainConfig(
+            window=config.window,
+            epochs=config.epochs,
+            batch_size=config.batch_size,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            num_layers=config.num_layers,
+            ff=config.ff,
+            dropout=config.dropout,
+            lr=config.lr,
+        )
+        self.model = None
+
+    def train(self, df: pd.DataFrame) -> None:
+        logger.info(f"Training SeqModel (window={self.cfg.window})...")
+        self.model, self.cfg = train_seq_model(
+            df, 
+            self.cfg, 
+            save_dir="models/Seq", 
+            resume=self.cfg.resume, 
+            fresh=self.cfg.fresh
+        )
+
+    def predict(self, df: pd.DataFrame) -> Dict[str, Any]:
+        if self.model is None:
+            raise RuntimeError("SeqModel not trained or loaded")
+        return predict_seq(self.model, self.cfg, df)
+
+    def save(self, save_dir: str) -> None:
+        path = Path(save_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        ckpt_path = _seq_ckpt_path(path, self.cfg)
+        if self.model:
+            torch.save(self.model.state_dict(), ckpt_path)
+            logger.info(f"SeqModel saved to {ckpt_path}")
+
+    def load(self, save_dir: str) -> bool:
+        path = Path(save_dir)
+        if not path.exists(): return False
+        
+        ckpt_path = _seq_ckpt_path(path, self.cfg)
+        if not ckpt_path.exists(): return False
+        
+        try:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # We need to rebuild the model structure to load weights
+            self.model = SeqModel(
+                d_model=self.cfg.d_model,
+                nhead=self.cfg.nhead,
+                num_layers=self.cfg.num_layers,
+                dim_feedforward=self.cfg.ff,
+                dropout=self.cfg.dropout,
+            ).to(device)
+            state = torch.load(ckpt_path, map_location=device, weights_only=True)
+            self.model.load_state_dict(state)
+            self.model.eval()
+            logger.info(f"SeqModel loaded from {ckpt_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load SeqModel: {e}")
+            return False
+
 

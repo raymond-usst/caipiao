@@ -136,3 +136,49 @@ def bayes_optimize_sumstd(
     best_score = float(search.best_score_)
     return best, best_score
 
+
+def random_optimize_sumstd(
+    df: pd.DataFrame,
+    window: int = 10,
+    samples: int = 20,
+    random_state: int = 42,
+) -> Tuple[Dict, float]:
+    """
+    随机搜索和值标准差模型超参，适用于不想用贝叶斯或噪声场景。
+    评估：顺序切分 80/20 做一次验证，指标用负 RMSE（越大越好）。
+    """
+    X, y = _prepare_dataset(df, window=window)
+    if len(y) < 50:
+        raise ValueError("样本不足，无法进行和值标准差随机调参")
+    split = int(len(y) * 0.8)
+    X_train, y_train = X[:split], y[:split]
+    X_val, y_val = X[split:], y[split:]
+
+    rng = np.random.default_rng(random_state)
+    best = None
+    best_score = -1e9
+    for _ in range(samples):
+        depth = int(rng.integers(4, 9))
+        lr = float(np.exp(rng.uniform(np.log(1e-3), np.log(0.3))))
+        it = int(rng.integers(80, 401))
+        model = CatBoostRegressor(
+            iterations=it,
+            depth=depth,
+            learning_rate=lr,
+            loss_function="RMSE",
+            verbose=False,
+            task_type="GPU" if torch.cuda.is_available() else "CPU",
+        )
+        try:
+            model.fit(X_train, y_train)
+            pred = model.predict(X_val)
+            rmse = float(np.sqrt(((pred - y_val) ** 2).mean()))
+            score = -rmse
+        except Exception:
+            score = -1e9
+        if score > best_score:
+            best_score = score
+            best = {"depth": depth, "learning_rate": lr, "iterations": it}
+    if best is None:
+        raise RuntimeError("和值标准差随机搜索未找到可行解")
+    return best, best_score

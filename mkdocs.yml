@@ -1,0 +1,36 @@
+site_name: Lottery AI Prediction System
+site_description: Advanced lottery prediction using ML/DL models
+site_author: Agentic AI
+
+theme:
+  name: material
+  palette:
+    primary: indigo
+    accent: amber
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - search.highlight
+
+nav:
+  - Home: index.md
+  - API Reference:
+    - Config: api/config.md
+    - Features: api/features.md
+    - Blender: api/blender.md
+    - Analyzer: api/analyzer.md
+    - Models: api/models.md
+  - User Guide:
+    - Quick Start: guide/quickstart.md
+    - Training: guide/training.md
+    - Dashboard: guide/dashboard.md
+
+plugins:
+  - search
+
+markdown_extensions:
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - admonition
+  - toc:
+      permalink: true

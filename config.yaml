@@ -1,0 +1,99 @@
+db:
+  path: "data/ssq.db"
+
+recent: 800
+sync: false
+
+cat:
+  enabled: true
+  window: 10
+  iterations: 300
+  depth: 6
+  learning_rate: 0.1
+  resume: true
+  fresh: false
+
+seq:
+  enabled: true
+  window: 20
+  epochs: 20
+  batch_size: 64
+  d_model: 96
+  nhead: 4
+  num_layers: 3
+  ff: 192
+  lr: 0.001
+  dropout: 0.1
+  resume: true
+  fresh: false
+
+tft:
+  enabled: false
+  window: 20
+  epochs: 20
+  batch_size: 64
+  d_model: 128
+  nhead: 4
+  layers: 3
+  ff: 256
+  lr: 0.001
+  freq_window: 50
+  entropy_window: 50
+  resume: true
+  fresh: false
+
+nhits:
+  enabled: false
+  input_size: 60
+  n_layers: 2
+  n_blocks: 1
+  max_steps: 200
+  learning_rate: 0.001
+  resume: true
+  fresh: false
+  backtest: false
+
+timesnet:
+  enabled: false
+  input_size: 120
+  hidden_size: 64
+  top_k: 5
+  max_steps: 300
+  learning_rate: 0.001
+  resume: true
+  fresh: false
+  backtest: false
+
+prophet:
+  enabled: false
+  resume: true
+  fresh: false
+
+gnn:
+  enabled: false
+  hidden_channels: 64
+  num_layers: 2
+  dropout: 0.5
+  lr: 0.01
+  epochs: 200
+  top_k_neighbors: 5
+  resume: true
+  fresh: false
+
+rl:
+  enabled: false
+  hidden_size: 128
+  learning_rate: 0.001
+  gamma: 0.99
+  episodes: 500
+  batch_size: 32
+  resume: true
+  fresh: false
+
+blend:
+  enabled: true
+  train_size: 300
+  test_size: 30
+  step: 30
+  alpha: 0.3
+  l1_ratio: 0.1

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 import os
+import random
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -15,7 +16,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 from lottery import analyzer, database, scraper, blender
-from lottery import ml_model, seq_model, tft_model, nhits_model, timesnet_model, prophet_model, validation, odd_model, sum_model
+from lottery import ml_model, seq_model, tft_model, nhits_model, timesnet_model, prophet_model, validation, odd_model, sum_model, pbt
 
 
 def cmd_sync(args) -> None:
@@ -309,22 +310,36 @@ def cmd_predict(args) -> None:
         tft_dr = 0.1
         tft_fw = 50
         tft_ew = 50
+        best_params = None
+        best_loss = 1e9
         if getattr(args, "bayes_tft", False):
             try:
-                best_params, best_loss = tft_model.bayes_optimize_tft(
+                bp, bl = tft_model.bayes_optimize_tft(
                     df, recent=max(args.bayes_tft_recent, args.recent or 0), n_iter=args.bayes_tft_calls
                 )
-                tft_window = int(best_params["window"])
-                tft_bs = int(best_params["batch"])
-                tft_lr = float(best_params["lr"])
-                tft_dm = int(best_params["d_model"])
-                tft_nh = int(best_params["nhead"])
-                tft_layers = int(best_params["layers"])
-                tft_ff = int(best_params["ff"])
-                tft_dr = float(best_params["dropout"])
-                print(f"[bayes-tft] 最优参数: {best_params}, loss={best_loss:.4f}")
+                best_params, best_loss = bp, bl
+                print(f"[bayes-tft] 最优参数: {bp}, loss={bl:.4f}")
             except Exception as e:
                 print(f"[bayes-tft][warn] 调参失败，回退默认: {e}")
+        if getattr(args, "tft_rand", False):
+            try:
+                rp, rl = tft_model.random_optimize_tft(
+                    df, recent=max(args.bayes_tft_recent, args.recent or 0), samples=args.tft_rand_samples
+                )
+                print(f"[rand-tft] 最优参数: {rp}, loss={rl:.4f}")
+                if rl < best_loss:
+                    best_params, best_loss = rp, rl
+            except Exception as e:
+                print(f"[rand-tft][warn] 调参失败，忽略: {e}")
+        if best_params:
+            tft_window = int(best_params["window"])
+            tft_bs = int(best_params["batch"])
+            tft_lr = float(best_params["lr"])
+            tft_dm = int(best_params["d_model"])
+            tft_nh = int(best_params["nhead"])
+            tft_layers = int(best_params["layers"])
+            tft_ff = int(best_params["ff"])
+            tft_dr = float(best_params["dropout"])
         tft_cfg = tft_model.TFTConfig(
             window=tft_window,
             batch=tft_bs,
@@ -432,21 +447,35 @@ def cmd_predict(args) -> None:
         tn_hidden = 64
         tn_topk = 5
         tn_dr = 0.1
+        best_params = None
+        best_loss = 1e9
         if getattr(args, "bayes_timesnet", False):
             try:
-                best_params, best_loss = timesnet_model.bayes_optimize_timesnet(
+                bp, bl = timesnet_model.bayes_optimize_timesnet(
                     df, recent=args.bayes_timesnet_recent, n_iter=args.bayes_timesnet_calls
                 )
-                tn_input = int(best_params["input_size"])
-                tn_hidden = int(best_params["hidden_size"])
-                tn_topk = int(best_params["top_k"])
-                tn_dr = float(best_params["dropout"])
-                tn_lr = float(best_params["learning_rate"])
-                tn_ms = int(best_params["max_steps"])
-                tn_bs = int(best_params["batch_size"])
-                print(f"[bayes-timesnet] 最优参数: {best_params}, loss={best_loss:.4f}")
+                best_params, best_loss = bp, bl
+                print(f"[bayes-timesnet] 最优参数: {bp}, loss={bl:.4f}")
             except Exception as e:
                 print(f"[bayes-timesnet][warn] 调参失败，回退默认: {e}")
+        if getattr(args, "timesnet_rand", False):
+            try:
+                rp, rl = timesnet_model.random_optimize_timesnet(
+                    df, recent=args.bayes_timesnet_recent, samples=args.timesnet_rand_samples
+                )
+                print(f"[rand-timesnet] 最优参数: {rp}, loss={rl:.4f}")
+                if rl < best_loss:
+                    best_params, best_loss = rp, rl
+            except Exception as e:
+                print(f"[rand-timesnet][warn] 调参失败，忽略: {e}")
+        if best_params:
+            tn_input = int(best_params["input_size"])
+            tn_hidden = int(best_params["hidden_size"])
+            tn_topk = int(best_params["top_k"])
+            tn_dr = float(best_params["dropout"])
+            tn_lr = float(best_params["learning_rate"])
+            tn_ms = int(best_params["max_steps"])
+            tn_bs = int(best_params["batch_size"])
         tn_cfg = timesnet_model.TimesNetConfig(
             input_size=tn_input,
             h=1,
@@ -810,6 +839,33 @@ def cmd_train_all(args) -> None:
     if not args.no_cat:
         if len(df) < args.cat_window + 1:
             print("[train-all][CatBoost] 样本不足，跳过")
+        elif args.pbt_cat:
+            print("[train-all][CatBoost] PBT 演化训练中...")
+            try:
+                from lottery.ml_model import CatModelAdapter
+                adapter = CatModelAdapter()
+                initial_configs = [
+                    {
+                        "window": args.cat_window,
+                        "depth": random.choice([4, 6, 8]),
+                        "learning_rate": random.choice([0.05, 0.1, 0.2]),
+                    }
+                    for _ in range(4)
+                ]
+                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=5, steps_per_gen=50, save_dir="models/pbt_cat")
+                runner.initialize(initial_configs)
+                best_member = runner.run()
+                models = best_member.model_state
+                print(f"[train-all][CatBoost] PBT 完成，最佳得分: {best_member.performance:.4f}")
+                
+                # Predict
+                preds = ml_model.predict_next(models, df, top_k=3)
+                print("[train-all][CatBoost] 训练完成(PBT)，最新窗口预测：")
+                for pos, items in preds["red"].items():
+                    print(f"  位置{pos} Top3: " + ", ".join([f"{n}({p:.3f})" for n, p in items]))
+                print("  蓝球 Top3: " + ", ".join([f"{n}({p:.3f})" for n, p in preds["blue"]]))
+            except Exception as e:
+                 print(f"[train-all][CatBoost][PBT] 失败: {e}")
         else:
             print("[train-all][CatBoost] 训练中...")
             cat_iter = args.cat_iter
@@ -848,6 +904,37 @@ def cmd_train_all(args) -> None:
     if not args.no_seq:
         if len(df) < args.seq_window + 1:
             print("[train-all][Transformer] 样本不足，跳过")
+        elif args.pbt_seq:
+            print("[train-all][Transformer] PBT 演化训练中...")
+            try:
+                from lottery.seq_model import SeqModelAdapter, TrainConfig
+                adapter = SeqModelAdapter()
+                initial_configs = [
+                    TrainConfig(
+                        window=args.seq_window,
+                        batch_size=64,
+                        epochs=1,
+                        lr=random.choice([1e-3, 5e-4]),
+                        d_model=96,
+                        nhead=4,
+                        num_layers=3,
+                        ff=192,
+                        dropout=0.1
+                    )
+                    for _ in range(4)
+                ]
+                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=5, steps_per_gen=5, save_dir="models/pbt_seq")
+                runner.initialize(initial_configs)
+                best_member = runner.run()
+                model = best_member.model_state
+                cfg = best_member.config
+                preds = seq_model.predict_seq(model, cfg, df)
+                print("[train-all][Transformer] PBT 完成，最新窗口预测：")
+                for pos, items in preds["red"].items():
+                    print(f"  位置{pos} Top3: " + ", ".join([f"{n}({p:.3f})" for n, p in items]))
+                print("  蓝球 Top3: " + ", ".join([f"{n}({p:.3f})" for n, p in preds['blue']]))
+            except Exception as e:
+                print(f"[train-all][Transformer][PBT] 失败: {e}")
         else:
             print("[train-all][Transformer] 训练中...")
             seq_window = args.seq_window
@@ -900,6 +987,35 @@ def cmd_train_all(args) -> None:
     if args.run_tft:
         if len(df) < args.tft_window + 1:
             print("[train-all][TFT] 样本不足，跳过")
+        elif args.pbt_tft:
+            print("[train-all][TFT] PBT 演化训练中...")
+            try:
+                from lottery.tft_model import TftModelAdapter, TFTConfig
+                adapter = TftModelAdapter()
+                initial_configs = [
+                    TFTConfig(
+                         window=args.tft_window,
+                         batch=64,
+                         epochs=1,
+                         lr=random.choice([1e-3, 5e-4]),
+                         d_model=128,
+                         nhead=4,
+                         layers=3,
+                    )
+                    for _ in range(4)
+                ]
+                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=5, steps_per_gen=5, save_dir="models/pbt_tft")
+                runner.initialize(initial_configs)
+                best_member = runner.run()
+                model = best_member.model_state
+                cfg = best_member.config
+                preds = tft_model.predict_tft(model, cfg, df)
+                print("[train-all][TFT] PBT 完成，最新窗口预测：")
+                for pos, items in preds["red"].items():
+                    print(f"  位置{pos} Top3: " + ", ".join([f"{n}({p:.3f})" for n, p in items]))
+                print("  蓝球 Top3: " + ", ".join([f"{n}({p:.3f})" for n, p in preds['blue']]))
+            except Exception as e:
+                 print(f"[train-all][TFT][PBT] 失败: {e}")
         else:
             print("[train-all][TFT] 训练中...（若无 GPU 将较耗时）")
             cfg = tft_model.TFTConfig(
@@ -929,6 +1045,30 @@ def cmd_train_all(args) -> None:
     if args.run_nhits:
         if len(df) < args.nhits_input + 1:
             print("[train-all][N-HiTS] 样本不足，跳过")
+        elif args.pbt_nhits:
+             print("[train-all][N-HiTS] PBT 演化训练中...")
+             try:
+                 from lottery.nhits_model import NHitsModelAdapter, NHitsConfig
+                 adapter = NHitsModelAdapter()
+                 initial_configs = [
+                     NHitsConfig(
+                         input_size=args.nhits_input,
+                         learning_rate=random.choice([1e-3, 5e-4]),
+                         max_steps=args.nhits_steps,
+                         batch_size=32,
+                         valid_size=0.1
+                     )
+                     for _ in range(4)
+                 ]
+                 runner = pbt.PBTRunner(adapter, df, population_size=4, generations=5, steps_per_gen=50, save_dir="models/pbt_nhits")
+                 runner.initialize(initial_configs)
+                 best_member = runner.run()
+                 nf = best_member.model_state
+                 cfg = best_member.config
+                 preds = nhits_model.predict_nhits(nf, cfg, df)
+                 print(f"[train-all][N-HiTS] PBT 完成，和值预测≈{preds['sum_pred']:.2f}，蓝球预测≈{preds['blue_pred']:.2f}")
+             except Exception as e:
+                 print(f"[train-all][N-HiTS][PBT] 失败: {e}")
         else:
             print("[train-all][N-HiTS] 训练中...")
             cfg = nhits_model.NHitsConfig(
@@ -955,6 +1095,26 @@ def cmd_train_all(args) -> None:
     if args.run_prophet:
         if len(df) < 20:
             print("[train-all][Prophet] 样本不足，跳过")
+        elif args.pbt_prophet:
+            print("[train-all][Prophet] PBT 演化训练中...")
+            try:
+                from lottery.prophet_model import ProphetModelAdapter, ProphetConfig
+                adapter = ProphetModelAdapter()
+                initial_configs = [
+                    ProphetConfig(
+                        changepoint_prior_scale=random.choice([0.01, 0.05, 0.1]),
+                        seasonality_prior_scale=random.choice([1.0, 10.0])
+                    )
+                    for _ in range(4)
+                ]
+                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=3, steps_per_gen=1, save_dir="models/pbt_prophet")
+                runner.initialize(initial_configs)
+                best_member = runner.run()
+                models = best_member.model_state
+                preds = prophet_model.predict_prophet(models, df)
+                print(f"[train-all][Prophet] PBT 完成，和值预测≈{preds['sum']:.2f}，蓝球预测≈{preds['blue']:.2f}")
+            except Exception as e:
+                print(f"[train-all][Prophet][PBT] 失败: {e}")
         else:
             print("[train-all][Prophet] 训练中...")
             cfg = prophet_model.ProphetConfig()
@@ -968,6 +1128,30 @@ def cmd_train_all(args) -> None:
     if args.run_timesnet:
         if len(df) < args.timesnet_input + 1:
             print("[train-all][TimesNet] 样本不足，跳过")
+        elif args.pbt_timesnet:
+            print("[train-all][TimesNet] PBT 演化训练中...")
+            try:
+                from lottery.timesnet_model import TimesNetModelAdapter, TimesNetConfig
+                adapter = TimesNetModelAdapter()
+                initial_configs = [
+                    TimesNetConfig(
+                        input_size=args.timesnet_input,
+                        hidden_size=args.timesnet_hidden,
+                        learning_rate=random.choice([1e-3, 5e-4]),
+                        max_steps=args.timesnet_steps,
+                        batch_size=32,
+                        valid_size=0.1
+                    )
+                    for _ in range(4)
+                ]
+                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=5, steps_per_gen=50, save_dir="models/pbt_timesnet")
+                runner.initialize(initial_configs)
+                best_member = runner.run()
+                nf = best_member.model_state
+                preds = timesnet_model.predict_timesnet(nf, df)
+                print(f"[train-all][TimesNet] PBT 完成，和值预测≈{preds['sum_pred']:.2f}，蓝球预测≈{preds['blue_pred']:.2f}")
+            except Exception as e:
+                print(f"[train-all][TimesNet][PBT] 失败: {e}")
         else:
             print("[train-all][TimesNet] 训练中...")
             cfg = timesnet_model.TimesNetConfig(
@@ -992,6 +1176,34 @@ def cmd_train_all(args) -> None:
         print("[train-all][Blender] 构建基础预测并训练融合模型...")
 
         base_predictors = []
+
+        # 0) 频率与随机基线（Random Fallback / Baseline）
+        # 频率基线
+        def pred_freq(hist_df):
+            cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
+            data = hist_df[cols].to_numpy(dtype=int)
+            reds = data[:, :6].ravel()
+            blues = data[:, 6]
+            red_freq = np.bincount(reds, minlength=34)
+            blue_freq = np.bincount(blues, minlength=17)
+            red_top = np.argsort(red_freq[1:])[::-1][:6] + 1
+            blue_top = np.argsort(blue_freq[1:])[::-1][:1] + 1
+            red_preds = {i + 1: [(int(n), 1.0 / len(red_top))] for i, n in enumerate(red_top[:6])}
+            blue_preds = [(int(blue_top[0]), 1.0)]
+            return {"red": red_preds, "blue": blue_preds, "sum_pred": float(data[-1, :].sum())}
+        base_predictors.append(pred_freq)
+
+        # 随机基线（兜底）
+        def pred_random(hist_df):
+            rng = np.random.default_rng(len(hist_df))
+            red_nums = rng.choice(np.arange(1, 34), size=6, replace=False)
+            blue_num = int(rng.integers(1, 17))
+            red_preds = {i + 1: [(int(n), 1.0 / 6)] for i, n in enumerate(red_nums)}
+            blue_preds = [(blue_num, 1.0)]
+            last_sum = float(hist_df[["red1", "red2", "red3", "red4", "red5", "red6", "blue"]].iloc[-1].sum())
+            return {"red": red_preds, "blue": blue_preds, "sum_pred": last_sum}
+        base_predictors.append(pred_random)
+        print(f"[train-all][Blender] 已添加频率与随机基线 predictors")
         # 1) CatBoost
         if not args.no_cat and len(df) >= args.cat_window + 1:
             cat_models = ml_model.train_models(
@@ -1124,6 +1336,7 @@ def cmd_train_all(args) -> None:
             def pred_pr(hist_df):
                 return prophet_model.predict_prophet(pr_m, hist_df)
 
+
             base_predictors.append(pred_pr)
 
         if len(base_predictors) < 2:
@@ -1144,6 +1357,113 @@ def cmd_train_all(args) -> None:
             print(f"[train-all][Blender] 红球位置 Top1 平均命中率: {avg_acc_r:.3f} (折数 {len(folds_r)})，最新融合红球: {fused_red}")
 
     print("[train-all] 执行完毕")
+
+def cmd_train_pbt(args) -> None:
+    db_path = Path(args.db)
+    with database.get_conn(db_path) as conn:
+        df = analyzer.load_dataframe(conn, recent=args.recent)
+    if df.empty:
+        print("数据库为空或样本不足。")
+        sys.exit(1)
+
+    print(f"[PBT] Target Model: {args.model}, Population: {args.pop_size}, Generations: {args.generations}")
+
+    dataset = df
+    adapter = None
+    initial_configs = []
+
+    if args.model == "seq":
+        from lottery.seq_model import SeqModelAdapter, TrainConfig
+        adapter = SeqModelAdapter()
+        # Create initial configs with some random variation or default
+        base_cfg = TrainConfig(
+            window=args.window,
+            batch_size=64,
+            epochs=1, # Not used in PBT step, but good for init
+            lr=1e-3,
+            d_model=96,
+            nhead=4,
+            num_layers=3,
+            ff=192,
+            dropout=0.1
+        )
+        initial_configs = [base_cfg for _ in range(args.pop_size)]
+    elif args.model == "cat":
+        from lottery.ml_model import CatModelAdapter
+        adapter = CatModelAdapter()
+        base_cfg = {
+            "window": args.window,
+            "depth": 6,
+            "learning_rate": 0.1,
+        }
+        initial_configs = [
+            {
+                "window": args.window,
+                "depth": random.choice([4, 6, 8]),
+                "learning_rate": random.choice([0.05, 0.1, 0.2]),
+            }
+            for _ in range(args.pop_size)
+        ]
+    elif args.model == "tft":
+        from lottery.tft_model import TftModelAdapter, TFTConfig
+        adapter = TftModelAdapter()
+        base_cfg = TFTConfig(
+            window=args.window,
+            batch=64,
+            epochs=1,
+            lr=1e-3,
+            d_model=128,
+            nhead=4,
+            layers=3,
+        )
+        initial_configs = [base_cfg for _ in range(args.pop_size)]
+    elif args.model == "nhits":
+        from lottery.nhits_model import NHitsModelAdapter, NHitsConfig
+        adapter = NHitsModelAdapter()
+        base_cfg = NHitsConfig(
+            input_size=60,
+            learning_rate=1e-3,
+            max_steps=100,
+            batch_size=32,
+            valid_size=0.1
+        )
+        initial_configs = [base_cfg for _ in range(args.pop_size)]
+    elif args.model == "timesnet":
+        from lottery.timesnet_model import TimesNetModelAdapter, TimesNetConfig
+        adapter = TimesNetModelAdapter()
+        base_cfg = TimesNetConfig(
+            input_size=60,
+            hidden_size=64,
+            learning_rate=1e-3,
+            max_steps=100,
+            batch_size=32,
+            valid_size=0.1
+        )
+        initial_configs = [base_cfg for _ in range(args.pop_size)]
+    elif args.model == "prophet":
+        from lottery.prophet_model import ProphetModelAdapter, ProphetConfig
+        adapter = ProphetModelAdapter()
+        base_cfg = ProphetConfig(
+            changepoint_prior_scale=0.05,
+            seasonality_prior_scale=10.0
+        )
+        initial_configs = [base_cfg for _ in range(args.pop_size)]
+    else:
+        print(f"Model {args.model} not yet supported for PBT.")
+        sys.exit(1)
+
+    runner = pbt.PBTRunner(
+        adapter=adapter,
+        dataset=dataset,
+        population_size=args.pop_size,
+        generations=args.generations,
+        steps_per_gen=args.steps_per_gen,
+        fraction=0.2,
+        save_dir=f"models/pbt_{args.model}",
+        n_jobs=args.n_jobs
+    )
+    runner.initialize(initial_configs)
+    runner.run()
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="双色球爬取与混沌概率分析")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1188,6 +1508,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_pred.add_argument("--bayes-tft", action="store_true", help="启用 TFT 贝叶斯调参")
     p_pred.add_argument("--bayes-tft-calls", type=int, default=4, help="TFT 贝叶斯搜索迭代次数")
     p_pred.add_argument("--bayes-tft-recent", type=int, default=400, help="TFT 贝叶斯调参使用的最近样本数")
+    p_pred.add_argument("--tft-rand", action="store_true", help="启用 TFT 随机调参兜底")
+    p_pred.add_argument("--tft-rand-samples", type=int, default=80, help="TFT 随机搜索采样数")
     p_pred.add_argument("--tft-backtest", action="store_true", help="对 TFT 进行流式回测")
     p_pred.add_argument("--tft-backtest-batch", type=int, default=128, help="TFT 回测批大小")
     p_pred.add_argument("--nhits-fresh", action="store_true", help="强制重训 N-HiTS 并覆盖保存")
@@ -1202,6 +1524,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_pred.add_argument("--bayes-timesnet", action="store_true", help="启用 TimesNet 贝叶斯调参")
     p_pred.add_argument("--bayes-timesnet-calls", type=int, default=4, help="TimesNet 贝叶斯搜索迭代次数")
     p_pred.add_argument("--bayes-timesnet-recent", type=int, default=400, help="TimesNet 贝叶斯调参使用的最近样本数")
+    p_pred.add_argument("--timesnet-rand", action="store_true", help="启用 TimesNet 随机调参兜底")
+    p_pred.add_argument("--timesnet-rand-samples", type=int, default=80, help="TimesNet 随机搜索采样数")
     p_pred.add_argument("--timesnet-backtest", action="store_true", help="对 TimesNet 进行流式回测")
     p_pred.add_argument("--timesnet-backtest-samples", type=int, default=300, help="TimesNet 回测滑动样本数上限")
     p_pred.add_argument("--stack-bayes", action="store_true", help="对 stacking 元模型启用贝叶斯调参")
@@ -1302,6 +1626,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_train_all.add_argument("--bayes-cat", action="store_true", help="开启 CatBoost 贝叶斯调参")
     p_train_all.add_argument("--bayes-cat-calls", type=int, default=8, help="CatBoost 贝叶斯搜索迭代次数")
     p_train_all.add_argument("--bayes-cat-cv", type=int, default=3, help="CatBoost 贝叶斯调参交叉验证折数")
+    p_train_all.add_argument("--pbt-cat", action="store_true", help="使用 PBT 演化训练 CatBoost")
     # Transformer
     p_train_all.add_argument("--no-seq", action="store_true", help="跳过 Transformer 训练")
     p_train_all.add_argument("--seq-window", type=int, default=20, help="Transformer 滑窗")
@@ -1317,6 +1642,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_train_all.add_argument("--bayes-seq", action="store_true", help="开启 Transformer 贝叶斯调参")
     p_train_all.add_argument("--bayes-seq-calls", type=int, default=6, help="Transformer 贝叶斯搜索迭代次数")
     p_train_all.add_argument("--bayes-seq-recent", type=int, default=400, help="Transformer 贝叶斯调参使用的最近样本数")
+    p_train_all.add_argument("--pbt-seq", action="store_true", help="使用 PBT 演化训练 Transformer")
     # TFT
     p_train_all.add_argument("--run-tft", action="store_true", help="开启 TFT 训练（耗时更长）")
     p_train_all.add_argument("--tft-window", type=int, default=20)
@@ -1335,6 +1661,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_train_all.add_argument("--bayes-tft", action="store_true", help="开启 TFT 贝叶斯调参")
     p_train_all.add_argument("--bayes-tft-calls", type=int, default=4, help="TFT 贝叶斯搜索迭代次数")
     p_train_all.add_argument("--bayes-tft-recent", type=int, default=400, help="TFT 贝叶斯调参使用的最近样本数")
+    p_train_all.add_argument("--tft-rand", action="store_true", help="启用 TFT 随机调参兜底")
+    p_train_all.add_argument("--pbt-tft", action="store_true", help="使用 PBT 演化训练 TFT")
     # N-HiTS
     p_train_all.add_argument("--run-nhits", action="store_true", help="开启 N-HiTS 训练（和值+蓝球单变量）")
     p_train_all.add_argument("--nhits-input", type=int, default=60, help="N-HiTS 输入窗口")
@@ -1347,6 +1675,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_train_all.add_argument("--bayes-nhits", action="store_true", help="开启 N-HiTS 贝叶斯调参")
     p_train_all.add_argument("--bayes-nhits-calls", type=int, default=4, help="N-HiTS 贝叶斯搜索迭代次数")
     p_train_all.add_argument("--bayes-nhits-recent", type=int, default=300, help="N-HiTS 贝叶斯调参使用的最近样本数")
+    p_train_all.add_argument("--pbt-nhits", action="store_true", help="使用 PBT 演化训练 N-HiTS")
     # Prophet
     p_train_all.add_argument("--run-prophet", action="store_true", help="开启 Prophet 训练（和值/蓝球单变量）")
     p_train_all.add_argument("--prophet-fresh", action="store_true", help="强制重训 Prophet 并覆盖保存")
@@ -1354,6 +1683,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_train_all.add_argument("--bayes-prophet", action="store_true", help="开启 Prophet 贝叶斯调参")
     p_train_all.add_argument("--bayes-prophet-calls", type=int, default=4, help="Prophet 贝叶斯搜索迭代次数")
     p_train_all.add_argument("--bayes-prophet-recent", type=int, default=200, help="Prophet 贝叶斯调参使用的最近样本数")
+    p_train_all.add_argument("--pbt-prophet", action="store_true", help="使用 PBT 演化训练 Prophet")
     # Blender
     p_train_all.add_argument("--run-blend", action="store_true", help="开启融合（蓝球/和值/红球位置动态加权）")
     # TimesNet
@@ -1369,7 +1699,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_train_all.add_argument("--bayes-timesnet", action="store_true", help="开启 TimesNet 贝叶斯调参")
     p_train_all.add_argument("--bayes-timesnet-calls", type=int, default=4, help="TimesNet 贝叶斯搜索迭代次数")
     p_train_all.add_argument("--bayes-timesnet-recent", type=int, default=400, help="TimesNet 贝叶斯调参使用的最近样本数")
+    p_train_all.add_argument("--timesnet-rand", action="store_true", help="启用 TimesNet 随机调参兜底")
+    p_train_all.add_argument("--pbt-timesnet", action="store_true", help="使用 PBT 演化训练 TimesNet")
     p_train_all.set_defaults(func=cmd_train_all)
+
+    p_pbt = sub.add_parser("train-pbt", help="使用 PBT (Population Based Training) 演化训练模型")
+    p_pbt.add_argument("--db", default="data/ssq.db", help="SQLite 数据库路径")
+    p_pbt.add_argument("--recent", type=int, default=800, help="使用最近 N 期样本")
+    p_pbt.add_argument("--model", type=str, required=True, choices=["seq", "cat", "tft", "nhits", "timesnet", "prophet"], help="目标模型")
+    p_pbt.add_argument("--pop-size", type=int, default=4, help="种群大小")
+    p_pbt.add_argument("--generations", type=int, default=10, help="演化代数")
+    p_pbt.add_argument("--steps-per-gen", type=int, default=1, help="每代训练步数 (epochs)")
+    p_pbt.add_argument("--n-jobs", type=int, default=1, help="并行线程数")
+    p_pbt.add_argument("--window", type=int, default=20, help="窗口大小")
+    p_pbt.set_defaults(func=cmd_train_pbt)
+
     return parser
 
 def main(argv: list[str] | None = None) -> None:

@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+from datetime import datetime
+from lottery.utils.logger import logger
+from lottery.engine.predictor import BasePredictor
+
+# Original imports
+
 import numpy as np
 import pandas as pd
+import copy
+import random
 from catboost import CatBoostClassifier
 import torch
 import os
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any
 from .features import build_features
+from .pbt import ModelAdapter, Member
+
 
 
 def _prepare_dataset(df: pd.DataFrame, window: int = 10):
@@ -26,7 +36,12 @@ def _prepare_dataset(df: pd.DataFrame, window: int = 10):
         window_slice = data[i - window : i].reshape(-1)
         # 组合哈希：使用窗口最后一期红球组合，捕捉历史组合模式
         last_reds = data[i - 1, :6]
-        combo_id = hash(tuple(sorted(int(x) for x in last_reds)))
+        # 使用 adler32 替代 hash() 以保证跨进程/跨平台确定性
+        # combo_id = hash(tuple(sorted(int(x) for x in last_reds)))
+        import zlib
+        reds_bytes = str(tuple(sorted(int(x) for x in last_reds))).encode("utf-8")
+        combo_id = zlib.adler32(reds_bytes)
+
         window_slice = np.concatenate([window_slice, np.array([combo_id], dtype=int), feats_arr[i]])
         X_list.append(window_slice)
         for p in range(6):
@@ -242,7 +257,10 @@ def predict_next(models: dict, df: pd.DataFrame, top_k: int = 3):
         raise ValueError("样本不足，无法进行预测")
     x = data[-window:].reshape(1, -1)
     last_reds = data[-1, :6]
-    combo_id = hash(tuple(sorted(int(xx) for xx in last_reds)))
+    import zlib
+    reds_bytes = str(tuple(sorted(int(xx) for xx in last_reds))).encode("utf-8")
+    combo_id = zlib.adler32(reds_bytes)
+
     feats_arr = build_features(df).to_numpy(dtype=float)
     x = np.concatenate([x, np.array([[combo_id]], dtype=int), feats_arr[-1:].astype(float)], axis=1)
 
@@ -256,5 +274,211 @@ def predict_next(models: dict, df: pd.DataFrame, top_k: int = 3):
     proba_b = blue_model.predict_proba(x)[0]
     top_idx_b = np.argsort(proba_b)[::-1][:top_k]
     blue_preds = [(int(i), float(proba_b[i])) for i in top_idx_b]
+    blue_preds = [(int(i), float(proba_b[i])) for i in top_idx_b]
     return {"red": red_preds, "blue": blue_preds}
+
+
+class CatModelAdapter(ModelAdapter):
+    def train_step(self, member: Member, dataset: pd.DataFrame, steps: int) -> Tuple[Any, float]:
+        # member.config is a dict like {'depth': 6, 'learning_rate': 0.1, ...}
+        cfg = member.config
+        window = cfg.get("window", 10)
+        X, y_red, y_blue = _prepare_dataset(dataset, window=window)
+        
+        # Current total iterations target
+        target_iter = member.step + steps
+        
+        # Params for this step
+        params = {
+            "iterations": target_iter,
+            "depth": cfg["depth"],
+            "learning_rate": cfg["learning_rate"],
+            "loss_function": "MultiClass",
+            "verbose": False,
+            "random_seed": 42,
+            "allow_writing_files": False,
+            "task_type": "GPU" if torch.cuda.is_available() else "CPU",
+        }
+        if torch.cuda.is_available():
+            params["devices"] = "0"
+
+        # Model state is a dict: {'red': {0: m, ...}, 'blue': m}
+        # If None, init empty
+        if member.model_state is None:
+            models = {"red": {}, "blue": None}
+        else:
+            models = member.model_state
+
+        # Helper to train one model
+        def train_one(model, X, y, p_name):
+            # Check if we can continue
+            init_model = None
+            if model is not None:
+                # Check compatibility: Depth cannot change for continuation
+                try:
+                    cur_depth = model.get_param("depth")
+                    if cur_depth is not None and int(cur_depth) != int(cfg["depth"]):
+                        init_model = None # Must restart
+                    else:
+                        init_model = model
+                except:
+                    init_model = model # Attempt to use it
+            
+            # If init_model is None (restarting), we need to set iterations = target_iter
+            new_model = CatBoostClassifier(**params)
+            try:
+                new_model.fit(X, y, init_model=init_model)
+            except Exception:
+                # Fallback: train from scratch if init failed
+                new_model = CatBoostClassifier(**params)
+                new_model.fit(X, y)
+            return new_model
+
+        # Train Red
+        losses = []
+        for p in range(6):
+            m = models["red"].get(p)
+            new_m = train_one(m, X, y_red[p], f"red{p}")
+            models["red"][p] = new_m
+            # valid_loss is best_score_['learn']['MultiClass']?
+            # CatBoost get_best_score() returns dict
+            try:
+                sc = new_m.get_best_score().get("learn", {}).get("MultiClass", 1.0)
+            except:
+                sc = 1.0
+            losses.append(sc)
+
+        # Train Blue
+        m_b = models["blue"]
+        new_b = train_one(m_b, X, y_blue, "blue")
+        models["blue"] = new_b
+        try:
+             sc_b = new_b.get_best_score().get("learn", {}).get("MultiClass", 1.0)
+        except:
+             sc_b = 1.0
+        losses.append(sc_b)
+        
+        avg_loss = sum(losses) / len(losses)
+        return models, -avg_loss # return -loss as "score" (higher is better)
+
+    def evaluate(self, member: Member, dataset: pd.DataFrame) -> float:
+        # Use last N samples to test accuracy
+        if member.model_state is None: return 0.0
+        models = member.model_state
+        models["window"] = member.config.get("window", 10) 
+        
+        # Manual backtest on last 20 samples
+        val_size = 20
+        df = dataset
+        if len(df) < val_size + 20: return 0.0
+        
+        hits = 0
+        total = 0
+        try:
+             # Loop 5 times
+             for i in range(5):
+                 slice_end = len(dataset) - i
+                 if slice_end < 100: continue
+                 
+                 curr_df = dataset.iloc[:slice_end]
+                 if slice_end >= len(dataset): continue
+                 
+                 target_blue = dataset.iloc[slice_end]["blue"]
+                 
+                 res = predict_next(models, curr_df, top_k=1)
+                 pred_blue = res["blue"][0][0]
+                 if pred_blue == target_blue:
+                     hits += 1
+                 total += 1
+        except Exception:
+            pass
+            
+        return hits / max(1, total)
+
+    def perturb_config(self, config: Dict) -> Dict:
+        new_cfg = copy.deepcopy(config)
+        # Explore depth, learning_rate
+        if random.random() < 0.3:
+            new_cfg["learning_rate"] *= random.choice([0.8, 1.2])
+        if random.random() < 0.2:
+            # Change depth
+            delta = random.choice([-1, 1])
+            new_cfg["depth"] = max(4, min(10, new_cfg["depth"] + delta))
+        return new_cfg
+
+
+class CatBoostPredictor(BasePredictor):
+    def __init__(self, config):
+        super().__init__(config)
+        # config is a CatBoostConfig object
+        self.window = config.window
+        self.iterations = config.iterations
+        self.depth = config.depth
+        self.learning_rate = config.learning_rate
+        self.models = None
+
+    def train(self, df: pd.DataFrame) -> None:
+        logger.info(f"Training CatBoost models (window={self.window})...")
+        self.models = train_models(
+            df,
+            window=self.window,
+            iterations=self.iterations,
+            depth=self.depth,
+            learning_rate=self.learning_rate,
+            save_dir=None, # We handle saving manually in save()
+            resume=False,
+            fresh=True
+        )
+
+    def predict(self, df: pd.DataFrame) -> Dict[str, Any]:
+        if self.models is None:
+            raise RuntimeError("Model not trained or loaded.")
+        
+        # update window in case it was loaded from disk with different window
+        self.models["window"] = self.window
+        return predict_next(self.models, df, top_k=3)
+
+    def save(self, save_dir: str) -> None:
+        path = Path(save_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        red_paths, blue_path = _cat_model_paths(path, self.window, self.iterations, self.depth, self.learning_rate)
+        
+        if self.models:
+            for p, m in self.models["red"].items():
+                m.save_model(red_paths[p], format="cbm")
+            self.models["blue"].save_model(blue_path, format="cbm")
+            logger.info(f"CatBoost models saved to {save_dir}")
+
+    def load(self, save_dir: str) -> bool:
+        path = Path(save_dir)
+        if not path.exists():
+            return False
+            
+        red_paths, blue_path = _cat_model_paths(path, self.window, self.iterations, self.depth, self.learning_rate)
+        
+        try:
+            loaded_red = {}
+            for p, pth in red_paths.items():
+                if not pth.exists(): return False
+                model = CatBoostClassifier()
+                model.load_model(pth)
+                loaded_red[p] = model
+            
+            if not blue_path.exists(): return False
+            blue_model = CatBoostClassifier()
+            blue_model.load_model(blue_path)
+            
+            self.models = {"red": loaded_red, "blue": blue_model, "window": self.window}
+            logger.info(f"CatBoost models loaded from {save_dir}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load CatBoost models: {e}")
+            return False
+
+
+    def save(self, member: Member, path: Path) -> None:
+         pass
+
+    def load(self, path: Path) -> Member:
+        pass
 

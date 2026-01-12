@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
+from lottery.utils.logger import logger
+from lottery.engine.predictor import BasePredictor
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
@@ -18,8 +22,10 @@ from neuralforecast import NeuralForecast
 from neuralforecast.models import TimesNet
 from torch.utils.data import IterableDataset
 from .features import build_features
-import numpy as np
-import torch
+from .pbt import ModelAdapter, Member
+import copy
+import random
+from typing import Any, Tuple
 
 FEAT_COLS = [
     "ac",
@@ -635,6 +641,88 @@ def train_timesnet(
     return nf, cfg
 
 
+def random_optimize_timesnet(
+    df: pd.DataFrame,
+    recent: int = 400,
+    samples: int = 60,
+    random_state: int = 42,
+):
+    """
+    重型随机搜索 TimesNet 超参，适合作为 TPE/贝叶斯不稳定时的兜底。
+    空间与当前 TPE 一致，评估采用稳健多次中位 + 软罚。
+    """
+    rng = np.random.default_rng(random_state)
+    df_recent = df.tail(max(220, min(recent if recent > 0 else len(df), 500)))
+    if len(df_recent) < 120:
+        raise ValueError("样本不足，无法进行 TimesNet 随机调参")
+
+    def _adjust_hidden(hid: int) -> int:
+        return int(hid if hid % 2 == 0 else hid + 1)
+
+    def _sample_one():
+        inp = int(rng.integers(90, min(200, len(df_recent) - 5) + 1))
+        hid = int(rng.integers(64, 121))
+        tk = int(rng.choice([3, 4]))
+        dr = float(rng.uniform(0.05, 0.15))
+        lr = float(np.exp(rng.uniform(np.log(3e-4), np.log(1.2e-3))))
+        ms = int(rng.integers(60, 111))
+        bs = int(rng.choice([16, 32]))
+        hid = _adjust_hidden(hid)
+        tk = max(1, min(tk, hid // 4 if hid // 4 > 0 else 1))
+        return [inp, hid, tk, dr, lr, ms, bs]
+
+    def _eval(params):
+        inp, hid, tk, dr, lr, ms, bs = params
+        cfg = TimesNetConfig(
+            input_size=int(inp),
+            h=1,
+            hidden_size=int(hid),
+            top_k=int(tk),
+            dropout=float(dr),
+            learning_rate=float(lr),
+            max_steps=int(ms),
+            batch_size=int(bs),
+            valid_size=0.1,
+            early_stop_patience_steps=2,
+        )
+        losses = []
+        fails = 0
+        for _ in range(3):
+            try:
+                eval_cfg = cfg
+                eval_cfg.max_steps = min(cfg.max_steps, 100)
+                loss = _eval_timesnet_loss(df_recent, eval_cfg, max_train=min(len(df_recent), 320))
+            except Exception:
+                loss = 300.0
+                fails += 1
+            losses.append(loss)
+        med = float(np.median(losses))
+        std_part = float(np.std(losses))
+        smooth = med + 0.3 * std_part
+        p_fail = fails / 3
+        return p_fail * 300 + (1 - p_fail) * smooth
+
+    best = None
+    best_loss = 1e9
+    for _ in range(samples):
+        cand = _sample_one()
+        loss = _eval(cand)
+        if loss < best_loss:
+            best_loss = loss
+            best = cand
+    if best is None:
+        raise RuntimeError("TimesNet 随机搜索未找到可行解")
+    return {
+        "input_size": int(best[0]),
+        "hidden_size": int(best[1]),
+        "top_k": int(best[2]),
+        "dropout": float(best[3]),
+        "learning_rate": float(best[4]),
+        "max_steps": int(best[5]),
+        "batch_size": int(best[6]),
+    }, float(best_loss)
+
+
 def predict_timesnet(nf: NeuralForecast, df: pd.DataFrame) -> Dict[str, float]:
     ts = _build_timeseries(df)
     fcst = nf.predict(ts)
@@ -676,5 +764,157 @@ def backtest_timesnet_model(
         except Exception:
             continue
     blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
+    blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
     return {"blue_top1": blue_hit, "samples": len(blue_hits)}
+
+
+class TimesNetModelAdapter(ModelAdapter):
+    def train_step(self, member: Member, dataset: pd.DataFrame, steps: int) -> Tuple[Any, float]:
+        cfg = member.config
+        ts = _build_timeseries(dataset)
+        val_size = max(cfg.valid_size, cfg.h)
+        
+        if member.model_state is None:
+             # Ensure hidden size is even
+             hid = cfg.hidden_size if cfg.hidden_size % 2 == 0 else cfg.hidden_size + 1
+             models = [
+                TimesNet(
+                    input_size=cfg.input_size,
+                    h=cfg.h,
+                    hidden_size=hid,
+                    top_k=cfg.top_k,
+                    dropout=cfg.dropout,
+                    learning_rate=cfg.learning_rate,
+                    max_steps=cfg.max_steps, 
+                    batch_size=cfg.batch_size,
+                    random_seed=42,
+                    early_stop_patience_steps=cfg.early_stop_patience_steps,
+                )
+            ]
+             nf = NeuralForecast(models=models, freq="D")
+        else:
+             nf = member.model_state
+             
+        for m in nf.models:
+             m.max_steps += 50
+             
+        try:
+            nf.fit(ts, val_size=val_size)
+            
+            dates = ts["ds"].unique()
+            dates.sort()
+            val_dates = dates[-cfg.h:]
+            cutoff_date = val_dates[0]
+            
+            ts_in = ts[ts["ds"] < cutoff_date]
+            
+            fcst = nf.predict(ts_in)
+            mae = 0.0
+            count = 0
+            for uid in ["sum", "blue"]:
+                 truth = ts[(ts["unique_id"] == uid) & (ts["ds"].isin(val_dates))]["y"].to_numpy()
+                 pred = fcst[fcst["unique_id"] == uid]["TimesNet"].to_numpy()
+                 min_len = min(len(truth), len(pred))
+                 if min_len > 0:
+                     mae += float(np.abs(truth[:min_len] - pred[:min_len]).mean())
+                     count += 1
+            loss = mae / count if count > 0 else 1000.0
+        except Exception as e:
+            print(f"TimesNet Train Step Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return nf, 0.0
+        
+        return nf, -loss
+
+    def evaluate(self, member: Member, dataset: pd.DataFrame) -> float:
+        nf = member.model_state
+        if nf is None: return 0.0
+        
+        if not getattr(nf, "fitted", False):
+            return 0.0
+            
+        cfg = member.config
+        
+        try:
+            res = backtest_timesnet_model(nf, cfg, dataset, max_samples=60)
+            score = res["blue_top1"]
+        except Exception:
+            return 0.0
+        return score
+
+    def perturb_config(self, config: TimesNetConfig) -> TimesNetConfig:
+        new_cfg = copy.deepcopy(config)
+        factors = [0.8, 1.2]
+        if random.random() < 0.3:
+            new_cfg.learning_rate *= random.choice(factors)
+        if random.random() < 0.3:
+             new_cfg.dropout = max(0.01, min(0.5, new_cfg.dropout * random.choice([0.9, 1.1])))
+        return new_cfg
+
+    def save(self, member: Member, path: Path) -> None:
+        if member.model_state:
+            with open(path, "wb") as f:
+                pickle.dump(member.model_state, f)
+
+    def load(self, path: Path) -> Member:
+        pass
+
+
+class TimesNetPredictor(BasePredictor):
+    def __init__(self, config):
+        super().__init__(config)
+        self.cfg = TimesNetConfig(
+            input_size=config.input_size,
+            h=1,
+            hidden_size=config.hidden_size,
+            top_k=config.top_k,
+            max_steps=config.max_steps,
+            learning_rate=config.learning_rate,
+            dropout=config.dropout,
+            batch_size=32,
+            valid_size=0.1
+        )
+        self.model = None
+
+    def train(self, df: pd.DataFrame) -> None:
+        logger.info(f"Training TimesNet (size={self.cfg.input_size})...")
+        self.model, self.cfg = train_timesnet(
+            df,
+            self.cfg,
+            save_dir="models/TimesNet",
+            resume=self.cfg.resume,
+            fresh=self.cfg.fresh
+        )
+
+    def predict(self, df: pd.DataFrame) -> Dict[str, Any]:
+        if self.model is None:
+            raise RuntimeError("TimesNet model not trained or loaded")
+        return predict_timesnet(self.model, df)
+    
+    def save(self, save_dir: str) -> None:
+        path = Path(save_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        # TimesNet also uses NeuralForecast object wrapper (pickle)
+        model_path = path / f"timesnet_in{self.cfg.input_size}_h{self.cfg.hidden_size}_{self.cfg.max_steps}s.pkl"
+        with open(model_path, "wb") as f:
+            pickle.dump(self.model, f)
+        logger.info(f"TimesNet model saved to {model_path}")
+
+    def load(self, save_dir: str) -> bool:
+        path = Path(save_dir)
+        if not path.exists(): return False
+        
+        model_path = path / f"timesnet_in{self.cfg.input_size}_h{self.cfg.hidden_size}_{self.cfg.max_steps}s.pkl"
+        if not model_path.exists(): return False
+        
+        try:
+            with open(model_path, "rb") as f:
+                self.model = pickle.load(f)
+            logger.info(f"TimesNet model loaded from {model_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load TimesNet model: {e}")
+            return False
+
 

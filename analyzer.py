@@ -571,3 +571,50 @@ def analyze(df: pd.DataFrame, entropy_window: int = 60) -> Dict:
         "rules": rules,
     }
 
+
+def show_basic_stats(df: pd.DataFrame) -> None:
+    stats = basic_stats(df)
+    print("\n[Basic Statistics]")
+    print(f"Count: {len(df)}")
+    for k, v in stats.items():
+        print(f"{k}: {v:.2f}")
+    print("\n")
+
+
+def analyze_correlations(df: pd.DataFrame) -> None:
+    print("[Correlations]")
+    red_cols = ["red1", "red2", "red3", "red4", "red5", "red6"]
+    df_red = df[red_cols]
+    corr = df_red.corr()
+    print(corr.round(3))
+    print("\n")
+def calculate_omission(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算每一期的遗漏值。
+    返回 DataFrame: index=issue, columns=1-33, values=当前期该号码已遗漏的期数。
+    """
+    red_cols = ["red1", "red2", "red3", "red4", "red5", "red6"]
+    issues = df["issue"].tolist()
+    data = df[red_cols].to_numpy(dtype=int)
+    
+    n_samples = len(data)
+    omissions = np.zeros((n_samples, 33), dtype=int)
+    
+    # 初始遗漏设为0（或假设极大值，这里设0简单递推）
+    # 更好的方式是从第一期开始累积。
+    
+    current_omission = np.zeros(33, dtype=int)
+    
+    for i in range(n_samples):
+        # 1. 之前遗漏 + 1
+        current_omission += 1
+        
+        # 2. 本期出现的号码遗漏归零
+        draw = data[i]
+        for num in draw:
+            if 1 <= num <= 33:
+                current_omission[num - 1] = 0
+                
+        omissions[i] = current_omission.copy()
+        
+    return pd.DataFrame(omissions, index=issues, columns=list(range(1, 34)))

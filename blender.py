@@ -228,12 +228,14 @@ def blend_blue_latest(
     X = feat.drop(columns=["idx", "issue"])
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-    clf = LogisticRegression(max_iter=500)
+    # 明确指定 multinomial，避免二分类歧义
+    clf = LogisticRegression(max_iter=500, multi_class='multinomial', solver='lbfgs')
     clf.fit(X_scaled, y)
     last_feat = X_scaled[-1].reshape(1, -1)
     proba = clf.predict_proba(last_feat)[0]
     top_idx = int(np.argmax(proba))
     return top_idx + 1, float(proba[top_idx])
+
 
 
 def blend_sum_latest(

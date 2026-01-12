@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
+from lottery.utils.logger import logger
+from lottery.engine.predictor import BasePredictor
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
@@ -21,6 +25,10 @@ from prophet import Prophet
 import numpy as np
 import logging
 from .features import build_features
+from .pbt import ModelAdapter, Member
+import copy
+import random
+from typing import Any, Tuple
 
 FEAT_COLS = [
     "ac",
@@ -52,6 +60,17 @@ def _build_series(df: pd.DataFrame, col: str, uid: str, feats: pd.DataFrame) -> 
     for c in FEAT_COLS:
         s[c] = feats[c].to_numpy()
     return s[["unique_id", "ds", "y", *FEAT_COLS]]
+
+
+def _softmax_from_value(val: float, num_classes: int, sigma: float = 3.0) -> list[tuple[int, float]]:
+    probs = []
+    denom = 0.0
+    for i in range(1, num_classes + 1):
+        diff = i - val
+        prob = np.exp(-(diff**2) / (2 * sigma**2))
+        probs.append((i, prob))
+        denom += prob
+    return [(i, p / denom) for i, p in probs]
 
 
 @dataclass
@@ -265,6 +284,7 @@ def predict_prophet(models: Dict[str, Prophet], df: pd.DataFrame) -> Dict[str, f
         if uid == "blue":
             classes = np.arange(1, 17, dtype=float)
             logits = -((classes - yhat) / 3.0) ** 2
+
             logits = logits - logits.max()
             p = np.exp(logits)
             p = p / p.sum()
@@ -279,4 +299,168 @@ def predict_prophet(models: Dict[str, Prophet], df: pd.DataFrame) -> Dict[str, f
             classes_r = np.arange(1, 34, dtype=int)
             probs["red_probs"] = [(int(c), float(pp)) for c, pp in zip(classes_r, pr)]
     return {**future, **probs}
+
+
+class ProphetModelAdapter(ModelAdapter):
+    def train_step(self, member: Member, dataset: pd.DataFrame, steps: int) -> Tuple[Any, float]:
+        cfg = member.config
+        
+        # Split for proper validation in PBT
+        # Valid size 20
+        valid_size = 20
+        if len(dataset) > valid_size + 60:
+            train_df = dataset.iloc[:-valid_size]
+            val_df = dataset.iloc[-valid_size:]
+        else:
+            train_df = dataset
+            val_df = dataset.iloc[-5:] # fallback
+            
+        fit_kwargs = {"iter": 1000, "seed": 42}
+        feats = build_features(train_df)
+        sum_df = _build_series(train_df.assign(sum_val=train_df[["red1", "red2", "red3", "red4", "red5", "red6", "blue"]].sum(axis=1)), "sum_val", "sum", feats)
+        blue_df = _build_series(train_df, "blue", "blue", feats)
+        
+        models = {}
+        
+        # Suppress output
+        logging.getLogger("cmdstanpy").setLevel(logging.CRITICAL)
+        logging.getLogger("prophet").setLevel(logging.ERROR)
+
+        for uid, s_df in [("sum", sum_df), ("blue", blue_df)]:
+            m = Prophet(
+                yearly_seasonality=cfg.yearly_seasonality,
+                weekly_seasonality=cfg.weekly_seasonality,
+                daily_seasonality=cfg.daily_seasonality,
+                changepoint_prior_scale=cfg.changepoint_prior_scale,
+                seasonality_prior_scale=cfg.seasonality_prior_scale,
+            )
+            for c in FEAT_COLS:
+                m.add_regressor(c)
+            
+            m.fit(s_df[["ds", "y", *FEAT_COLS]], **fit_kwargs)
+            models[uid] = m
+        
+        # Calculate loss on validation set
+        # MAE of blue ball?
+        feats_val = build_features(dataset) # Need full feats including val part
+        # Actually build_features on full dataset is safer.
+        # But we need feats aligned with val_df rows.
+        # _build_series uses a 'features' df.
+        # Let's re-build series for val.
+        val_blue = _build_series(val_df, "blue", "blue", feats_val.loc[val_df.index])
+        
+        m_blue = models["blue"]
+        future = val_blue[["ds", *FEAT_COLS]]
+        fcst = m_blue.predict(future)
+        yhat = fcst["yhat"].to_numpy()
+        y = val_blue["y"].to_numpy()
+        mae = float(np.mean(np.abs(yhat - y)))
+        
+        return models, -mae
+
+    def evaluate(self, member: Member, dataset: pd.DataFrame) -> float:
+        models = member.model_state
+        if models is None: return 0.0
+        
+        try:
+            # Backtest / Score
+            # Use last 20 for eval
+            valid_size = 20
+            df = dataset
+            if len(df) < valid_size + 20: return 0.0
+            
+            hits = 0 
+            total = 0
+            
+            feats = build_features(df)
+            target_df = df.iloc[-valid_size:]
+            
+            m_blue = models["blue"]
+            
+            # Build regressor matrix
+            s_blue = _build_series(target_df, "blue", "blue", feats.loc[target_df.index])
+            future = s_blue[["ds", *FEAT_COLS]]
+            # Suppress prophet logging
+            logging.getLogger("prophet").setLevel(logging.CRITICAL)
+            fcst = m_blue.predict(future)
+            
+            preds = fcst["yhat"].to_numpy()
+            trues = s_blue["y"].to_numpy()
+            
+            for p, t in zip(preds, trues):
+                 probs = _softmax_from_value(p, 16)
+                 probs.sort(key=lambda x: x[1], reverse=True)
+                 top1 = probs[0][0]
+                 if top1 == int(t):
+                     hits += 1
+                 total += 1
+                 
+            return hits / max(1, total)
+        except Exception as e:
+            print(f"Prophet Eval Error: {e}")
+            return 0.0
+
+    def perturb_config(self, config: ProphetConfig) -> ProphetConfig:
+        new_cfg = copy.deepcopy(config)
+        factors = [0.8, 1.2]
+        if random.random() < 0.4:
+            new_cfg.changepoint_prior_scale *= random.choice(factors)
+        if random.random() < 0.4:
+            new_cfg.seasonality_prior_scale *= random.choice(factors)
+        return new_cfg
+
+    def save(self, member: Member, path: Path) -> None:
+        if member.model_state:
+            with open(path, "wb") as f:
+                pickle.dump(member.model_state, f)
+
+    def load(self, path: Path) -> Member:
+        pass
+
+
+class ProphetPredictor(BasePredictor):
+    def __init__(self, config):
+        super().__init__(config)
+        self.cfg = ProphetConfig() # Prophet config is mostly empty/defaults for now
+        self.model = None
+
+    def train(self, df: pd.DataFrame) -> None:
+        logger.info(f"Training Prophet...")
+        self.model, self.cfg = train_prophet(
+            df,
+            self.cfg,
+            save_dir=None,
+            resume=False,
+            fresh=True
+        )
+
+    def predict(self, df: pd.DataFrame) -> Dict[str, Any]:
+        if self.model is None:
+            raise RuntimeError("Prophet model not trained or loaded")
+        return predict_prophet(self.model, df)
+    
+    def save(self, save_dir: str) -> None:
+        path = Path(save_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        model_path = path / "prophet.pkl"
+        with open(model_path, "wb") as f:
+            pickle.dump(self.model, f)
+        logger.info(f"Prophet model saved to {model_path}")
+
+    def load(self, save_dir: str) -> bool:
+        path = Path(save_dir)
+        if not path.exists(): return False
+        
+        model_path = path / "prophet.pkl"
+        if not model_path.exists(): return False
+        
+        try:
+            with open(model_path, "rb") as f:
+                self.model = pickle.load(f)
+            logger.info(f"Prophet model loaded from {model_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load Prophet model: {e}")
+            return False
+
 

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
+from lottery.utils.logger import logger
+from lottery.engine.predictor import BasePredictor
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -11,7 +15,11 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 from torch.optim import Adam
 from .features import build_features
+from .features import build_features
 import torch.nn.functional as F
+from .pbt import ModelAdapter, Member
+import copy
+import random
 
 COMBO_VOCAB = 20000  # 红球组合哈希桶
 
@@ -26,8 +34,10 @@ def _entropy(counts: np.ndarray) -> float:
 
 def combo_hash(reds: np.ndarray) -> int:
     """对排序后的红球组合做哈希映射，位置无关组合特征。"""
+    import zlib
     reds_sorted = tuple(sorted(int(x) for x in reds))
-    return hash(reds_sorted) % COMBO_VOCAB
+    # 使用 adler32 保证确定性
+    return zlib.adler32(str(reds_sorted).encode("utf-8")) % COMBO_VOCAB
 
 
 def _build_feature_matrix(df: pd.DataFrame, freq_window: int = 50, entropy_window: int = 50) -> np.ndarray:
@@ -288,143 +298,297 @@ def _quick_tft_loss(df: pd.DataFrame, cfg: "TFTConfig", max_epochs: int = 4) -> 
 def bayes_optimize_tft(
     df: pd.DataFrame,
     recent: int = 400,
-    n_iter: int = 15,
+    n_iter: int = 40,
     random_state: int = 42,
+    heavy_epochs: int | None = None,
+    tpe_trials: int | None = None,
 ):
     """
-    使用 skopt 对 TFT 做轻量贝叶斯超参搜索，目标为短周期loss。
+    使用 Optuna TPE + 多保真 + 稳健评估，对 TFT 做轻量超参搜索。
+    - 离散/收缩空间，确保 d_model 可整除 nhead
+    - 轻评估筛选，重评 + 局部扰动多起点，连续失败放宽 lr/dropout
+    - trimmed mean + std 惩罚，失败软罚 + 重试
     """
-    try:
-        from skopt import gp_minimize
-        from skopt.space import Integer, Real, Categorical
-    except Exception as e:
-        raise ImportError("需要安装 scikit-optimize 以运行 TFT 贝叶斯调参") from e
-
-    df_recent = df if recent <= 0 else df.tail(max(recent, 120))
-    if len(df_recent) < 80:
+    df_recent = df if recent <= 0 else df.tail(max(220, min(recent, 500)))
+    if len(df_recent) < 120:
         raise ValueError("样本不足，无法进行 TFT 贝叶斯调参")
 
-    space_coarse = [
-        Integer(10, 24, name="window"),
-        Integer(80, 192, name="d_model"),
-        Categorical([2, 4], name="nhead"),
-        Integer(2, 4, name="layers"),
-        Integer(160, 400, name="ff"),
-        Real(0.05, 0.25, name="dropout"),
-        Real(3e-4, 3e-3, prior="log-uniform", name="lr"),
-        Categorical([32, 64], name="batch"),
-    ]
+    # 离散化空间，降低搜索难度
+    space = {
+        "window": [10, 12, 14, 16, 18, 20, 22, 24],
+        "d_model": [96, 128, 160, 192],
+        "nhead": [2, 4],
+        "layers": [2, 3, 4],
+        "ff": [200, 240, 280, 320, 360, 400, 440, 480],
+        "dropout": (0.05, 0.2),
+        "lr": (3e-4, 1.2e-3),
+        "batch": [32, 64],
+    }
 
-    def _adjust_dm(dm: int, nh: int, low: int, high: int) -> int:
+    def _adjust_dm(dm: int, nh: int) -> int:
         dm_adj = int(np.ceil(dm / nh) * nh)
-        dm_adj = max(low, min(high, dm_adj))
-        if dm_adj % nh != 0:  # 再次兜底
+        if dm_adj % nh != 0:
             dm_adj = (dm_adj // nh) * nh
-        return dm_adj
+        return max(min(dm_adj, max(space["d_model"])), min(space["d_model"]))
 
-    def objective(params):
+    fail_stats = {"fails": 0, "total": 0}
+
+    def _eval_with_mode(params, light: bool = False, heavy_ep: int | None = None) -> float:
+        """
+        light：短步数、较小窗口、软罚；heavy：正式评估。
+        采用 trimmed mean + 0.3*std，失败软罚，重试一次。
+        """
         w, dm, nh, ly, ff, dr, lr, bs = params
-        dm = _adjust_dm(dm, nh, space_coarse[1].low, space_coarse[1].high)
+        dm = _adjust_dm(dm, nh)
         cfg = TFTConfig(
-            window=w,
-            batch=bs,
-            epochs=6,
-            lr=lr,
-            d_model=dm,
-            nhead=nh,
-            layers=ly,
-            ff=ff,
-            dropout=dr,
+            window=int(w),
+            batch=int(bs),
+            epochs=8 if light else (heavy_ep or 12),
+            patience=3 if light else 6,
+            lr=float(lr),
+            d_model=int(dm),
+            nhead=int(nh),
+            layers=int(ly),
+            ff=int(ff),
+            dropout=float(dr),
             topk=1,
             freq_window=50,
             entropy_window=50,
         )
-        try:
-            loss = _quick_tft_loss(df_recent, cfg, max_epochs=4)
-        except Exception:
-            return 1e3
-        return loss
-
-    n_calls = max(int(n_iter), 12)
-    n_coarse = max(6, n_calls // 2)
-    n_fine = max(6, n_calls - n_coarse)
-
-    def _run_search(space, calls):
-        try:
-            res = gp_minimize(
-                objective,
-                space,
-                n_calls=calls,
-                random_state=random_state,
-                verbose=False,
-            )
-            return res.x, float(res.fun)
-        except Exception:
-            rng = np.random.default_rng(random_state)
-            loc_best = None
-            loc_loss = 1e9
-            for _ in range(calls):
-                w = rng.integers(space[0].low, space[0].high + 1)
-                dm = rng.integers(space[1].low, space[1].high + 1)
-                nh = rng.choice(space[2].categories)
-                ly = rng.integers(space[3].low, space[3].high + 1)
-                ff = rng.integers(space[4].low, space[4].high + 1)
-                dr = float(rng.uniform(space[5].low, space[5].high))
-                lr = float(np.exp(rng.uniform(np.log(space[6].low), np.log(space[6].high))))
-                bs = int(rng.choice(space[7].categories))
-                dm = _adjust_dm(int(dm), int(nh), space[1].low, space[1].high)
-                cfg = TFTConfig(
-                    window=int(w),
-                    batch=bs,
-                    epochs=6,
-                    lr=lr,
-                    d_model=int(dm),
-                    nhead=int(nh),
-                    layers=int(ly),
-                    ff=int(ff),
-                    dropout=dr,
-                    topk=1,
-                    freq_window=50,
-                    entropy_window=50,
+        trials = 3 if light else 4
+        penalty = 190.0 if light else 210.0
+        losses: list[float] = []
+        fails = 0
+        for _ in range(trials):
+            try:
+                loss = _quick_tft_loss(
+                    df_recent,
+                    cfg,
+                    max_epochs=5 if light else (heavy_ep or 8),
                 )
+            except Exception:
+                # 软罚并尝试降步数重试一次
                 try:
-                    loss = _quick_tft_loss(df_recent, cfg, max_epochs=4)
+                    loss = _quick_tft_loss(
+                        df_recent,
+                        cfg,
+                        max_epochs=3 if light else (heavy_ep or 7),
+                    )
                 except Exception:
-                    loss = 1e3
-                if loss < loc_loss:
-                    loc_loss = loss
-                    loc_best = [w, dm, nh, ly, ff, dr, lr, bs]
-            return loc_best, loc_loss
+                    loss = penalty
+                fails += 1
+            losses.append(loss)
+        fail_stats["fails"] += fails
+        fail_stats["total"] += trials
+        arr = np.sort(losses)
+        trimmed = arr[1:-1] if len(arr) > 3 else arr
+        med = float(np.median(trimmed))
+        std_part = float(np.std(trimmed))
+        smooth_loss = med + 0.3 * std_part
+        p_fail = fails / trials
+        return p_fail * penalty + (1 - p_fail) * smooth_loss
 
-    best, best_loss = _run_search(space_coarse, n_coarse)
+    try:
+        import optuna
+        from optuna.study import StudyDirection
+    except Exception as e:
+        raise ImportError("需要安装 optuna 以运行 TFT 贝叶斯调参") from e
 
-    if best is not None:
-        b_w, b_dm, b_nh, b_ly, b_ff, b_dr, b_lr, b_bs = best
-        b_dm = _adjust_dm(int(b_dm), int(b_nh), space_coarse[1].low, space_coarse[1].high)
-        space_fine = [
-            Integer(max(8, int(b_w) - 4), min(28, int(b_w) + 4), name="window"),
-            Integer(max(64, int(b_dm) - 40), min(240, int(b_dm) + 40), name="d_model"),
-            Categorical([int(b_nh), 2, 4]),
-            Integer(max(1, int(b_ly) - 1), min(6, int(b_ly) + 1), name="layers"),
-            Integer(max(128, int(b_ff) - 100), min(480, int(b_ff) + 100), name="ff"),
-            Real(max(0.02, b_dr / 2), min(0.3, b_dr * 2), name="dropout"),
-            Real(max(1e-4, b_lr / 2), min(5e-3, b_lr * 2), prior="log-uniform", name="lr"),
-            Categorical([b_bs, 32, 64]),
+    def _optuna_objective(trial: "optuna.Trial"):
+        fail_ratio = fail_stats["fails"] / fail_stats["total"] if fail_stats["total"] > 0 else 0.0
+        lr_low_eff = 2e-4 if fail_ratio >= 0.5 else space["lr"][0]
+        lr_high_eff = 1.5e-3 if fail_ratio >= 0.5 else space["lr"][1]
+        dr_high_eff = 0.12 if fail_ratio >= 0.5 else space["dropout"][1]
+
+        w = trial.suggest_categorical("window", space["window"])
+        dm = trial.suggest_categorical("d_model", space["d_model"])
+        nh = trial.suggest_categorical("nhead", space["nhead"])
+        ly = trial.suggest_categorical("layers", space["layers"])
+        ff = trial.suggest_categorical("ff", space["ff"])
+        dr = float(trial.suggest_float("dropout", space["dropout"][0], space["dropout"][1]))
+        dr = float(np.clip(dr, space["dropout"][0], dr_high_eff))
+        lr = float(trial.suggest_float("lr", space["lr"][0], space["lr"][1], log=True))
+        lr = float(np.clip(lr, lr_low_eff, lr_high_eff))
+        bs = trial.suggest_categorical("batch", space["batch"])
+        return _eval_with_mode([w, dm, nh, ly, ff, dr, lr, bs], light=True)
+
+    study = optuna.create_study(direction=StudyDirection.MINIMIZE, sampler=optuna.samplers.TPESampler(seed=random_state))
+    tpe_trials_eff = tpe_trials if tpe_trials is not None else max(70, min(90, int(n_iter)))
+    study.optimize(_optuna_objective, n_trials=tpe_trials_eff, show_progress_bar=False)
+
+    # 重评与多起点局部扰动
+    topk = min(10, len(study.trials))
+    sorted_trials = sorted(study.trials, key=lambda t: t.value)[:topk]
+    seeds = [random_state + i * 101 for i in range(topk)]
+    best = None
+    best_loss = 1e9
+
+    def _maybe_relax_bounds():
+        nonlocal space
+        space["dropout"] = (space["dropout"][0], 0.12)
+        space["lr"] = (2e-4, 1.5e-3)
+
+    fail_counts = 0
+    for t, sd in zip(sorted_trials, seeds):
+        p = t.params
+        cand = [
+            int(p["window"]),
+            int(p["d_model"]),
+            int(p["nhead"]),
+            int(p["layers"]),
+            int(p["ff"]),
+            float(p["dropout"]),
+            float(p["lr"]),
+            int(p["batch"]),
         ]
-        fine_res, fine_loss = _run_search(space_fine, n_fine)
-        if fine_res is not None and fine_loss < best_loss:
-            best, best_loss = fine_res, fine_loss
+        # 连续失败放宽
+        fail_ratio = fail_stats["fails"] / fail_stats["total"] if fail_stats["total"] > 0 else 0.0
+        lr_low_eff = 2e-4 if fail_ratio >= 0.5 else space["lr"][0]
+        lr_high_eff = 1.5e-3 if fail_ratio >= 0.5 else space["lr"][1]
+        dr_high_eff = 0.12 if fail_ratio >= 0.5 else space["dropout"][1]
+        cand[5] = float(np.clip(cand[5], space["dropout"][0], dr_high_eff))
+        cand[6] = float(np.clip(cand[6], lr_low_eff, lr_high_eff))
+
+        loss = _eval_with_mode(cand, light=False)
+        if loss < best_loss:
+            best_loss = loss
+            best = cand
+        else:
+            fail_counts += 1
+            if fail_counts >= max(2, topk // 2):
+                _maybe_relax_bounds()
+        rng = np.random.default_rng(sd)
+        for _ in range(16):
+            loc_inp = int(rng.choice(space["window"]))
+            loc_dm = _adjust_dm(int(rng.choice(space["d_model"])), int(cand[2]))
+            loc_tk = int(rng.choice(space["nhead"]))  # 实际 top_k 不适用 TFT，这里保持 nhead
+            loc_ly = int(rng.choice(space["layers"]))
+            loc_ff = int(rng.choice(space["ff"]))
+            loc_dr = float(np.clip(rng.normal(cand[5], 0.02), space["dropout"][0], dr_high_eff))
+            loc_lr = float(np.clip(rng.normal(cand[6], cand[6] * 0.25), lr_low_eff, lr_high_eff))
+            loc_bs = int(rng.choice(space["batch"]))
+            loc_cand = [loc_inp, loc_dm, cand[2], loc_ly, loc_ff, loc_dr, loc_lr, loc_bs]
+            loc_loss = _eval_with_mode(loc_cand, light=False)
+            if loc_loss < best_loss:
+                best_loss = loc_loss
+                best = loc_cand
+
+    if best is None:
+        raise RuntimeError("TFT 贝叶斯优化未找到可行解")
+
     best_params = {
-        "window": best[0],
-        "d_model": int(_adjust_dm(int(best[1]), int(best[2]), space_coarse[1].low, space_coarse[1].high)),
+        "window": int(best[0]),
+        "d_model": int(_adjust_dm(int(best[1]), int(best[2]))),
         "nhead": int(best[2]),
-        "layers": best[3],
-        "ff": best[4],
-        "dropout": best[5],
-        "lr": best[6],
-        "batch": best[7],
+        "layers": int(best[3]),
+        "ff": int(best[4]),
+        "dropout": float(best[5]),
+        "lr": float(best[6]),
+        "batch": int(best[7]),
     }
     return best_params, best_loss
+
+
+def random_optimize_tft(
+    df: pd.DataFrame,
+    recent: int = 400,
+    samples: int = 80,
+    random_state: int = 42,
+):
+    """
+    重型随机搜索 TFT 超参，作为 TPE/贝叶斯的兜底。
+    空间与离散 TPE 一致，评估沿用稳健 trimmed mean + 软罚。
+    """
+    rng = np.random.default_rng(random_state)
+    df_recent = df.tail(max(220, min(recent if recent > 0 else len(df), 500)))
+    if len(df_recent) < 120:
+        raise ValueError("样本不足，无法进行 TFT 随机调参")
+
+    space = {
+        "window": [10, 12, 14, 16, 18, 20, 22, 24],
+        "d_model": [96, 128, 160, 192],
+        "nhead": [2, 4],
+        "layers": [2, 3, 4],
+        "ff": [200, 240, 280, 320, 360, 400, 440, 480],
+        "dropout": (0.05, 0.2),
+        "lr": (3e-4, 1.2e-3),
+        "batch": [32, 64],
+    }
+
+    def _adjust_dm(dm: int, nh: int) -> int:
+        dm_adj = int(np.ceil(dm / nh) * nh)
+        return max(min(dm_adj, max(space["d_model"])), min(space["d_model"]))
+
+    def _eval(params):
+        w, dm, nh, ly, ff, dr, lr, bs = params
+        dm = _adjust_dm(dm, nh)
+        cfg = TFTConfig(
+            window=int(w),
+            batch=int(bs),
+            epochs=10,
+            patience=5,
+            lr=float(lr),
+            d_model=int(dm),
+            nhead=int(nh),
+            layers=int(ly),
+            ff=int(ff),
+            dropout=float(dr),
+            topk=1,
+            freq_window=50,
+            entropy_window=50,
+        )
+        trials = 3
+        penalty = 210.0
+        losses = []
+        fails = 0
+        for _ in range(trials):
+            try:
+                loss = _quick_tft_loss(df_recent, cfg, max_epochs=6)
+            except Exception:
+                try:
+                    loss = _quick_tft_loss(df_recent, cfg, max_epochs=5)
+                except Exception:
+                    loss = penalty
+                fails += 1
+            losses.append(loss)
+        arr = np.sort(losses)
+        trimmed = arr[1:-1] if len(arr) > 3 else arr
+        med = float(np.median(trimmed))
+        std_part = float(np.std(trimmed))
+        smooth = med + 0.3 * std_part
+        p_fail = fails / trials
+        return p_fail * penalty + (1 - p_fail) * smooth
+
+    best = None
+    best_loss = 1e9
+    for _ in range(samples):
+        cand = [
+            int(rng.choice(space["window"])),
+            int(rng.choice(space["d_model"])),
+            int(rng.choice(space["nhead"])),
+            int(rng.choice(space["layers"])),
+            int(rng.choice(space["ff"])),
+            float(rng.uniform(space["dropout"][0], space["dropout"][1])),
+            float(np.exp(rng.uniform(np.log(space["lr"][0]), np.log(space["lr"][1])))),
+            int(rng.choice(space["batch"])),
+        ]
+        loss = _eval(cand)
+        if loss < best_loss:
+            best_loss = loss
+            best = cand
+    if best is None:
+        raise RuntimeError("TFT 随机搜索未找到可行解")
+    best_params = {
+        "window": int(best[0]),
+        "d_model": int(_adjust_dm(int(best[1]), int(best[2]))),
+        "nhead": int(best[2]),
+        "layers": int(best[3]),
+        "ff": int(best[4]),
+        "dropout": float(best[5]),
+        "lr": float(best[6]),
+        "batch": int(best[7]),
+    }
+    return best_params, float(best_loss)
 
 
 def train_tft(
@@ -579,5 +743,182 @@ def backtest_tft_model(
                 red_hits.extend((pred_r == red_true).float().cpu().tolist())
     red_hit = float(np.mean(red_hits)) if red_hits else 0.0
     blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
+    blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
     return {"red_top1": red_hit, "blue_top1": blue_hit, "samples": len(dataset)}
+
+
+class TftModelAdapter(ModelAdapter):
+    def train_step(self, member: Member, dataset: pd.DataFrame, steps: int) -> Tuple[Any, float]:
+        cfg = member.config
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Init or load model
+        if member.model_state is None:
+             # Need to infer feature_dim from dataset?
+             # Construct dataset just to check dim?
+             temp_ds = TFTDataset(dataset, window=cfg.window, freq_window=cfg.freq_window, entropy_window=cfg.entropy_window)
+             feat_dim = temp_ds[0][0].shape[-1]
+             model = SimpleTFT(
+                feature_dim=feat_dim,
+                d_model=cfg.d_model,
+                nhead=cfg.nhead,
+                num_layers=cfg.layers,
+                ff=cfg.ff,
+                dropout=cfg.dropout,
+            ).to(device)
+        else:
+            model = member.model_state.to(device)
+            
+        ds = TFTDataset(dataset, window=cfg.window, freq_window=cfg.freq_window, entropy_window=cfg.entropy_window)
+        loader = DataLoader(ds, batch_size=cfg.batch, shuffle=True, collate_fn=collate_tft)
+        opt = Adam(model.parameters(), lr=cfg.lr)
+        mse = nn.MSELoss()
+        
+        def focal_loss(logits: torch.Tensor, target: torch.Tensor, gamma: float = 2.0) -> torch.Tensor:
+            log_probs = torch.log_softmax(logits, dim=1)
+            probs = torch.exp(log_probs)
+            pt = probs.gather(1, target.unsqueeze(1)).squeeze(1)
+            log_pt = log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
+            loss = -((1 - pt) ** gamma) * log_pt
+            return loss.mean()
+
+        model.train()
+        total_loss = 0.0
+        n_batches = 0
+        
+        for _ in range(steps):
+             for x, y, combo in loader:
+                x, y, combo = x.to(device), y.to(device), combo.to(device)
+                opt.zero_grad()
+                reds, blue, aux = model(x, combo_ids=combo)
+                
+                loss = focal_loss(blue, y[:, -1] - 1)
+                for i, head_out in enumerate(reds):
+                    loss = loss + focal_loss(head_out, y[:, i] - 1)
+                
+                sum_target = y[:, :7].sum(dim=1).float() / (33 * 6 + 16)
+                odd_target = (y[:, :6] % 2).sum(dim=1)
+                span_target = (y[:, :6].max(dim=1).values - y[:, :6].min(dim=1).values).float() / 33.0
+                
+                loss = (
+                    loss
+                    + cfg.aux_sum_weight * mse(aux["sum"].squeeze(-1), sum_target)
+                    + cfg.aux_odd_weight * focal_loss(aux["odd"], odd_target)
+                    + cfg.aux_span_weight * mse(aux["span"].squeeze(-1), span_target)
+                )
+
+                loss.backward()
+                opt.step()
+                total_loss += loss.item()
+                n_batches += 1
+                
+        avg_loss = total_loss / max(1, n_batches)
+        return model.cpu(), avg_loss
+
+    def evaluate(self, member: Member, dataset: pd.DataFrame) -> float:
+        cfg = member.config
+        model = member.model_state
+        if model is None: return 0.0
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        model.eval()
+        
+        val_size = 40
+        if len(dataset) > val_size + cfg.window:
+             val_df = dataset.iloc[-val_size - cfg.window:]
+        else:
+             val_df = dataset # fallback
+             
+        res = backtest_tft_model(model, cfg, val_df, batch_size=cfg.batch)
+        score = (res["red_top1"] + res["blue_top1"]) / 2
+        model.cpu()
+        return score
+
+    def perturb_config(self, config: TFTConfig) -> TFTConfig:
+        new_cfg = copy.deepcopy(config)
+        factors = [0.8, 1.2]
+        if random.random() < 0.3:
+            new_cfg.lr *= random.choice(factors)
+        if random.random() < 0.3:
+            new_cfg.dropout = max(0.01, min(0.5, new_cfg.dropout * random.choice([0.9, 1.1])))
+        if random.random() < 0.3:
+             new_cfg.ff = int(new_cfg.ff * random.choice(factors))
+        return new_cfg
+
+    def save(self, member: Member, path: Path) -> None:
+        if member.model_state:
+            torch.save(member.model_state.state_dict(), path)
+
+    def load(self, path: Path) -> Member:
+        pass
+
+
+class TFTPredictor(BasePredictor):
+    def __init__(self, config):
+        super().__init__(config)
+        self.cfg = TFTConfig(
+            window=config.window,
+            batch=config.batch_size,
+            epochs=config.epochs,
+            lr=config.lr,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            layers=config.layers,
+            ff=config.ff,
+            dropout=config.dropout,
+            freq_window=config.freq_window,
+            entropy_window=config.entropy_window,
+        )
+        self.model = None
+
+    def train(self, df: pd.DataFrame) -> None:
+        logger.info(f"Training TFT (window={self.cfg.window})...")
+        self.model, self.cfg = train_tft(
+            df,
+            self.cfg,
+            save_dir="models/TFT",
+            resume=self.cfg.resume,
+            fresh=self.cfg.fresh
+        )
+
+    def predict(self, df: pd.DataFrame) -> Dict[str, Any]:
+        if self.model is None:
+            raise RuntimeError("TFT model not trained or loaded")
+        # Ensure model is on correct device
+        return predict_tft(self.model, self.cfg, df)
+    
+    def save(self, save_dir: str) -> None:
+        path = Path(save_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        ckpt_path = _tft_ckpt_path(path, self.cfg)
+        if self.model:
+            torch.save(self.model.state_dict(), ckpt_path)
+            logger.info(f"TFT model saved to {ckpt_path}")
+
+    def load(self, save_dir: str) -> bool:
+        path = Path(save_dir)
+        if not path.exists(): return False
+        
+        ckpt_path = _tft_ckpt_path(path, self.cfg)
+        if not ckpt_path.exists(): return False
+        try:
+             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+             self.model = SimpleTFT(
+                d_model=self.cfg.d_model,
+                nhead=self.cfg.nhead,
+                num_layers=self.cfg.layers,
+                dim_feedforward=self.cfg.ff,
+                dropout=self.cfg.dropout,
+             ).to(device)
+             
+             state = torch.load(ckpt_path, map_location=device, weights_only=True)
+             self.model.load_state_dict(state)
+             self.model.eval()
+             logger.info(f"TFT model loaded from {ckpt_path}")
+             return True
+        except Exception as e:
+            logger.error(f"Failed to load TFT model: {e}")
+            return False
+
 
