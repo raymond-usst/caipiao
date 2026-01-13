@@ -1,0 +1,663 @@
+from __future__ import annotations
+
+from datetime import datetime
+from lottery.utils.logger import logger
+from lottery.engine.predictor import BasePredictor
+
+import math
+import copy
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Tuple, List
+
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader, IterableDataset
+from torch.optim import Adam
+from .features import build_features
+from .features import build_features
+from .pbt import ModelAdapter, Member
+
+
+PAD_ID = 0
+RED_OFFSET = 0
+BLUE_OFFSET = 33  # reds: 1-33, blues will be offset to 34-49
+VOCAB_SIZE = 33 + 16 + 1  # +1 for padding
+COMBO_VOCAB = 20000  # 哈希桶，用于红球组合 embedding
+FEAT_DIM = 14  # 手工特征维度
+
+
+def encode_draw(row: np.ndarray) -> List[int]:
+    # row: [red1..red6, blue]
+    reds = row[:6].tolist()
+    blue = int(row[6]) + BLUE_OFFSET
+    return reds + [blue]
+
+
+def combo_hash(reds: np.ndarray) -> int:
+    """对排序后的红球组合做哈希，映射到固定桶."""
+    import zlib
+    reds_sorted = tuple(sorted(int(x) for x in reds))
+    # 使用 adler32 保证确定性
+    return zlib.adler32(str(reds_sorted).encode("utf-8")) % COMBO_VOCAB
+
+
+class DrawDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, window: int = 20):
+        cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
+        data = df[cols].to_numpy(dtype=int)
+        feats_arr = build_features(df).to_numpy(dtype=float)
+        self.window = window
+        self.samples = []
+        for i in range(window, len(data)):
+            hist = data[i - window : i]
+            target = data[i]
+            src_tokens = [t for draw in hist for t in encode_draw(draw)]
+            tgt_tokens = encode_draw(target)
+            combo_id = combo_hash(target[:6])
+            feat_vec = feats_arr[i]
+            self.samples.append((src_tokens, tgt_tokens, combo_id, feat_vec))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        src, tgt, combo_id, feat_vec = self.samples[idx]
+        return (
+            torch.tensor(src, dtype=torch.long),
+            torch.tensor(tgt, dtype=torch.long),
+            torch.tensor(combo_id, dtype=torch.long),
+            torch.tensor(feat_vec, dtype=torch.float32),
+        )
+
+
+def collate_batch(batch):
+    src_list, tgt_list, combo_list, feat_list = zip(*batch)
+    max_len = max(len(x) for x in src_list)
+    src_pad = []
+    for src in src_list:
+        pad_len = max_len - len(src)
+        if pad_len > 0:
+            src = torch.cat([src, torch.zeros(pad_len, dtype=torch.long)])
+        src_pad.append(src)
+    src_pad = torch.stack(src_pad)
+    tgt = torch.stack(tgt_list)  # shape [B, 7]
+    combo = torch.stack(combo_list)
+    feats = torch.stack(feat_list)
+    return src_pad, tgt, combo, feats
+
+
+class StreamingBacktestDataset(IterableDataset):
+    """
+    适用于大规模回测的流式数据集，避免一次性构造所有样本。
+    """
+
+    def __init__(self, df: pd.DataFrame, window: int = 20):
+        self.df = df
+        self.window = window
+
+    def __iter__(self):
+        cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
+        data = self.df[cols].to_numpy(dtype=int)
+        feats_arr = build_features(self.df).to_numpy(dtype=float)
+        for i in range(self.window, len(data)):
+            hist = data[i - self.window : i]
+            target = data[i]
+            src_tokens = [t for draw in hist for t in encode_draw(draw)]
+            tgt_tokens = encode_draw(target)
+            combo_id = combo_hash(target[:6])
+            feat_vec = feats_arr[i]
+            yield (
+                torch.tensor(src_tokens, dtype=torch.long),
+                torch.tensor(tgt_tokens, dtype=torch.long),
+                torch.tensor(combo_id, dtype=torch.long),
+                torch.tensor(feat_vec, dtype=torch.float32),
+            )
+
+    def __len__(self):
+        return max(0, len(self.df) - self.window)
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 2000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:, : x.size(1)]
+
+
+class SeqModel(nn.Module):
+    def __init__(self, d_model: int = 96, nhead: int = 4, num_layers: int = 3, dim_feedforward: int = 192, dropout: float = 0.1):
+        super().__init__()
+        self.embed = nn.Embedding(VOCAB_SIZE, d_model, padding_idx=PAD_ID)
+        self.pos = PositionalEncoding(d_model)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.combo_emb = nn.Embedding(COMBO_VOCAB, d_model)
+        self.feat_proj = nn.Linear(FEAT_DIM, d_model)
+        self.head_red = nn.ModuleList([nn.Linear(d_model, 33) for _ in range(6)])
+        self.head_blue = nn.Linear(d_model, 16)
+
+    def forward(self, src: torch.Tensor, combo_ids: torch.Tensor | None = None, feats: torch.Tensor | None = None) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        x = self.embed(src)
+        x = self.pos(x)
+        h = self.encoder(x)  # [B, L, d]
+        pooled = self.pool(h.transpose(1, 2)).squeeze(-1)  # [B, d]
+        if combo_ids is not None:
+            pooled = pooled + self.combo_emb(combo_ids)
+        if feats is not None:
+            pooled = pooled + self.feat_proj(feats)
+        reds = [head(pooled) for head in self.head_red]
+        blue = self.head_blue(pooled)
+        return reds, blue
+
+
+@dataclass
+class TrainConfig:
+    window: int = 20
+    batch_size: int = 64
+    epochs: int = 30
+    patience: int = 8
+    min_delta: float = 1e-3
+    lr: float = 1e-3
+    d_model: int = 96
+    nhead: int = 4
+    num_layers: int = 3
+    ff: int = 192
+    dropout: float = 0.1
+    topk: int = 3
+
+
+def _seq_ckpt_path(save_dir: Path, cfg: TrainConfig) -> Path:
+    base = f"seq_w{cfg.window}_dm{cfg.d_model}_h{cfg.nhead}_l{cfg.num_layers}_ff{cfg.ff}_dr{cfg.dropout}_lr{cfg.lr}"
+    return save_dir / f"{base}.pt"
+
+
+def _focal_loss(logits: torch.Tensor, target: torch.Tensor, gamma: float = 2.0, alpha: float | None = None) -> torch.Tensor:
+    """
+    简单 Focal Loss (multiclass): alpha 可为标量，gamma 默认 2.0
+    """
+    log_probs = torch.log_softmax(logits, dim=1)
+    probs = torch.exp(log_probs)
+    pt = probs.gather(1, target.unsqueeze(1)).squeeze(1)
+    log_pt = log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
+    loss = -((1 - pt) ** gamma) * log_pt
+    if alpha is not None:
+        loss = alpha * loss
+    return loss.mean()
+
+
+def _quick_seq_loss(df: pd.DataFrame, cfg: TrainConfig, max_epochs: int = 6) -> float:
+    """
+    用于贝叶斯优化的快速评估：短周期训练+返回最后一个epoch的平均loss。
+    不保存模型，主要追求相对指标。
+    """
+    dataset = DrawDataset(df, window=cfg.window)
+    if len(dataset) < 10:
+        raise ValueError("样本不足，无法评估")
+    loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_batch)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = SeqModel(
+        d_model=cfg.d_model,
+        nhead=cfg.nhead,
+        num_layers=cfg.num_layers,
+        dim_feedforward=cfg.ff,
+        dropout=cfg.dropout,
+    ).to(device)
+    opt = Adam(model.parameters(), lr=cfg.lr)
+    model.train()
+    last_loss = 1e3
+    for _ in range(max_epochs):
+        total = 0.0
+        steps = 0
+        for src, tgt, combo, feats in loader:
+            src, tgt, combo, feats = src.to(device), tgt.to(device), combo.to(device), feats.to(device)
+            opt.zero_grad()
+            reds, blue = model(src, combo_ids=combo, feats=feats)
+            loss = _focal_loss(blue, tgt[:, -1] - BLUE_OFFSET - 1)
+            for i, head_out in enumerate(reds):
+                loss = loss + _focal_loss(head_out, tgt[:, i] - 1)
+            loss.backward()
+            opt.step()
+            total += loss.item()
+            steps += 1
+        last_loss = total / max(1, steps)
+    return float(last_loss)
+
+
+def bayes_optimize_seq(
+    df: pd.DataFrame,
+    recent: int = 400,
+    n_iter: int = 15,
+    random_state: int = 42,
+):
+    """
+    使用 skopt 对 Transformer 序列模型做快速贝叶斯超参搜索。
+    评估指标：短周期训练后的平均loss（越低越好）。
+    """
+    try:
+        from skopt import gp_minimize
+        from skopt.space import Integer, Real, Categorical
+    except Exception as e:
+        raise ImportError("需要安装 scikit-optimize 以运行 Transformer 贝叶斯调参") from e
+
+    df_recent = df if recent <= 0 else df.tail(max(recent, 80))
+    if len(df_recent) < 60:
+        raise ValueError("样本不足，无法进行 Transformer 贝叶斯调参")
+
+    space_coarse = [
+        Integer(10, 20, name="window"),
+        Integer(96, 192, name="d_model"),
+        Categorical([2, 4], name="nhead"),
+        Integer(2, 4, name="num_layers"),
+        Integer(160, 360, name="ff"),
+        Real(0.05, 0.25, name="dropout"),
+        Real(3e-4, 3e-3, prior="log-uniform", name="lr"),
+        Categorical([32, 64], name="batch_size"),
+    ]
+
+    def objective(params):
+        w, dm, nh, nl, ff, dr, lr, bs = params
+        cfg = TrainConfig(
+            window=w,
+            batch_size=bs,
+            epochs=6,
+            lr=lr,
+            d_model=dm,
+            nhead=nh,
+            num_layers=nl,
+            ff=ff,
+            dropout=dr,
+            topk=1,
+        )
+        try:
+            loss = _quick_seq_loss(df_recent, cfg, max_epochs=6)
+        except Exception:
+            return 1e3
+        return loss
+
+    n_calls = max(int(n_iter), 12)
+    n_coarse = max(6, n_calls // 2)
+    n_fine = max(6, n_calls - n_coarse)
+
+    def _run_search(space, calls):
+        try:
+            res = gp_minimize(
+                objective,
+                space,
+                n_calls=calls,
+                random_state=random_state,
+                verbose=False,
+            )
+            return res.x, float(res.fun)
+        except Exception:
+            rng = np.random.default_rng(random_state)
+            loc_best = None
+            loc_loss = 1e9
+            for _ in range(calls):
+                w = rng.integers(space[0].low, space[0].high + 1)
+                dm = rng.integers(space[1].low, space[1].high + 1)
+                nh = rng.choice(space[2].categories)
+                nl = rng.integers(space[3].low, space[3].high + 1)
+                ff = rng.integers(space[4].low, space[4].high + 1)
+                dr = float(rng.uniform(space[5].low, space[5].high))
+                lr = float(np.exp(rng.uniform(np.log(space[6].low), np.log(space[6].high))))
+                bs = int(rng.choice(space[7].categories))
+                cfg = TrainConfig(
+                    window=int(w),
+                    batch_size=bs,
+                    epochs=6,
+                    lr=lr,
+                    d_model=int(dm),
+                    nhead=int(nh),
+                    num_layers=int(nl),
+                    ff=int(ff),
+                    dropout=dr,
+                    topk=1,
+                )
+                try:
+                    loss = _quick_seq_loss(df_recent, cfg, max_epochs=6)
+                except Exception:
+                    loss = 1e3
+                if loss < loc_loss:
+                    loc_loss = loss
+                    loc_best = [w, dm, nh, nl, ff, dr, lr, bs]
+            return loc_best, loc_loss
+
+    best, best_loss = _run_search(space_coarse, n_coarse)
+
+    if best is not None:
+        b_w, b_dm, b_nh, b_nl, b_ff, b_dr, b_lr, b_bs = best
+        space_fine = [
+            Integer(max(6, int(b_w) - 4), min(24, int(b_w) + 4), name="window"),
+            Integer(max(64, int(b_dm) - 48), min(240, int(b_dm) + 48), name="d_model"),
+            Categorical([b_nh, 2, 4]),
+            Integer(max(1, int(b_nl) - 1), min(6, int(b_nl) + 1), name="num_layers"),
+            Integer(max(128, int(b_ff) - 100), min(512, int(b_ff) + 100), name="ff"),
+            Real(max(0.01, b_dr / 2), min(0.3, b_dr * 2), name="dropout"),
+            Real(max(1e-4, b_lr / 2), min(5e-3, b_lr * 2), prior="log-uniform", name="lr"),
+            Categorical([b_bs, 32, 64]),
+        ]
+        fine_res, fine_loss = _run_search(space_fine, n_fine)
+        if fine_res is not None and fine_loss < best_loss:
+            best, best_loss = fine_res, fine_loss
+    best_params = {
+        "window": best[0],
+        "d_model": best[1],
+        "nhead": best[2],
+        "num_layers": best[3],
+        "ff": best[4],
+        "dropout": best[5],
+        "lr": best[6],
+        "batch_size": best[7],
+    }
+    return best_params, best_loss
+
+
+def train_seq_model(
+    df: pd.DataFrame,
+    cfg: TrainConfig,
+    save_dir: str | None = "models",
+    resume: bool = True,
+    fresh: bool = False,
+):
+    dataset = DrawDataset(df, window=cfg.window)
+    if len(dataset) < 10:
+        raise ValueError("样本不足，无法训练序列模型")
+    loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_batch)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = SeqModel(
+        d_model=cfg.d_model,
+        nhead=cfg.nhead,
+        num_layers=cfg.num_layers,
+        dim_feedforward=cfg.ff,
+        dropout=cfg.dropout,
+    ).to(device)
+
+    ckpt_path = None
+    if save_dir is not None:
+        ckpt_path = _seq_ckpt_path(Path(save_dir), cfg)
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        if resume and not fresh and ckpt_path.exists():
+            try:
+                state = torch.load(ckpt_path, map_location=device, weights_only=True)
+                model.load_state_dict(state)
+                model.eval()
+                print(f"[Transformer] 检测到已保存模型，直接加载 {ckpt_path}")
+                return model, cfg
+            except Exception as e:
+                print(f"[Transformer] 加载已保存模型失败，将重新训练: {e}")
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+
+    model.train()
+    prev_loss = None
+    deltas = []
+    ep = 0
+    # 基于近5轮 loss 差分的滑动均值收敛：avg(dl[-5:]) < 0.004 且已跑满 cfg.epochs
+    while True:
+        ep += 1
+        total_loss = 0.0
+        steps = 0
+        for src, tgt, combo, feats in loader:
+            src, tgt, combo, feats = src.to(device), tgt.to(device), combo.to(device), feats.to(device)
+            opt.zero_grad()
+            reds, blue = model(src, combo_ids=combo, feats=feats)
+            loss = _focal_loss(blue, tgt[:, -1] - BLUE_OFFSET - 1)
+            for i, head_out in enumerate(reds):
+                loss = loss + _focal_loss(head_out, tgt[:, i] - 1)
+            loss.backward()
+            opt.step()
+            total_loss += loss.item()
+            steps += 1
+        avg_loss = total_loss / max(1, steps)
+        if prev_loss is not None:
+            delta = abs(avg_loss - prev_loss)
+            deltas.append(delta)
+            if len(deltas) >= 5:
+                mean_delta = sum(deltas[-5:]) / 5
+                print(f"[Transformer] epoch {ep}, loss={avg_loss:.4f}, mean_dl5={mean_delta:.4f}")
+                if mean_delta < 0.004 and ep >= cfg.epochs:
+                    print(f"[Transformer] Early stop at epoch {ep}, mean_dl5={mean_delta:.4f}")
+                    break
+            else:
+                print(f"[Transformer] epoch {ep}, loss={avg_loss:.4f}, dl={delta:.4f}")
+        else:
+            print(f"[Transformer] epoch {ep}, loss={avg_loss:.4f}")
+        prev_loss = avg_loss
+    model.eval()
+    if ckpt_path is not None:
+        torch.save(model.state_dict(), ckpt_path)
+        print(f"[Transformer] 模型已保存到 {ckpt_path}")
+    return model, cfg
+
+class SeqModelAdapter(ModelAdapter):
+    def train_step(self, member: Member, dataset: pd.DataFrame, steps: int) -> Tuple[Any, float]:
+        cfg = member.config
+        # If model_state is None, initialize new model
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        if member.model_state is None:
+             model = SeqModel(
+                d_model=cfg.d_model,
+                nhead=cfg.nhead,
+                num_layers=cfg.num_layers,
+                dim_feedforward=cfg.ff,
+                dropout=cfg.dropout,
+            ).to(device)
+        else:
+            model = member.model_state.to(device)
+            model.train()
+            
+        ds = DrawDataset(dataset, window=cfg.window)
+        loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_batch)
+        opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+        
+        # Train for 'steps' epochs
+        model.train()
+        total_loss = 0.0
+        n_batches = 0
+        
+        # Since 'steps' in our simplified logic is "epochs", we iterate epochs
+        for _ in range(steps):
+             for src, tgt, combo, feats in loader:
+                src, tgt, combo, feats = src.to(device), tgt.to(device), combo.to(device), feats.to(device)
+                opt.zero_grad()
+                reds, blue = model(src, combo_ids=combo, feats=feats)
+                loss = _focal_loss(blue, tgt[:, -1] - BLUE_OFFSET - 1)
+                for i, head_out in enumerate(reds):
+                    loss = loss + _focal_loss(head_out, tgt[:, i] - 1)
+                loss.backward()
+                opt.step()
+                total_loss += loss.item()
+                n_batches += 1
+                
+        avg_loss = total_loss / max(1, n_batches)
+        # Return state on CPU to save GPU memory during population management
+        return model.cpu(), avg_loss
+
+    def evaluate(self, member: Member, dataset: pd.DataFrame) -> float:
+        # Evaluate using backtest style (accuracy) on validation set (e.g. last 10%)
+        # For simplicity, using last 40 samples as 'validation'
+        cfg = member.config
+        model = member.model_state
+        if model is None: return 0.0
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        model.eval()
+        
+        # Use simple validation split
+        val_size = 40
+        if len(dataset) > val_size + cfg.window:
+             val_df = dataset.iloc[-val_size - cfg.window:]
+        else:
+             val_df = dataset
+             
+        res = backtest_seq_model(model, cfg, val_df, batch_size=cfg.batch_size)
+        # Score = Average of Red Top1 and Blue Top1
+        score = (res["red_top1"] + res["blue_top1"]) / 2
+        model.cpu()
+        return score
+
+    def perturb_config(self, config: TrainConfig) -> TrainConfig:
+        new_cfg = copy.deepcopy(config)
+        # Perturb with 1.2 or 0.8 factor randomly
+        factors = [0.8, 1.2]
+        
+        if random.random() < 0.3:
+            new_cfg.lr *= random.choice(factors)
+        if random.random() < 0.3:
+            new_cfg.dropout = max(0.01, min(0.5, new_cfg.dropout * random.choice([0.9, 1.1])))
+        if random.random() < 0.3:
+            new_cfg.batch_size = int(max(16, new_cfg.batch_size * random.choice(factors)))
+            
+        return new_cfg
+
+    def save(self, member: Member, path: Path) -> None:
+        if member.model_state:
+            torch.save(member.model_state.state_dict(), path)
+
+    def load(self, path: Path) -> Member:
+        raise NotImplementedError("Not strictly needed for basic PBT flow yet")
+
+
+def predict_seq(model: SeqModel, cfg: TrainConfig, df: pd.DataFrame) -> Dict:
+    cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
+    data = df[cols].to_numpy(dtype=int)
+    if len(data) < cfg.window:
+        raise ValueError("样本不足，无法预测")
+    seq = data[-cfg.window :]
+    combo_id = combo_hash(seq[-1, :6])
+    tokens = [t for draw in seq for t in encode_draw(draw)]
+    feats = build_features(df).iloc[-1].to_numpy(dtype=float)
+    x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0)
+    combo = torch.tensor([combo_id], dtype=torch.long)
+    feats_t = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
+    device = next(model.parameters()).device
+    x, combo, feats_t = x.to(device), combo.to(device), feats_t.to(device)
+    with torch.no_grad():
+        reds, blue = model(x, combo_ids=combo, feats=feats_t)
+    red_preds = {}
+    for i, head_out in enumerate(reds):
+        probs = torch.softmax(head_out[0], dim=0).cpu().numpy()
+        top_idx = np.argsort(probs)[::-1][: cfg.topk]
+        red_preds[i + 1] = [(int(idx + 1), float(probs[idx])) for idx in top_idx]
+    probs_b = torch.softmax(blue[0], dim=0).cpu().numpy()
+    top_idx_b = np.argsort(probs_b)[::-1][: cfg.topk]
+    blue_preds = [(int(idx + 1), float(probs_b[idx])) for idx in top_idx_b]
+    return {"red": red_preds, "blue": blue_preds}
+
+
+def backtest_seq_model(
+    model: SeqModel,
+    cfg: TrainConfig,
+    df: pd.DataFrame,
+    batch_size: int = 128,
+) -> Dict[str, float]:
+    """
+    大规模回测：使用 IterableDataset 流式遍历全部样本，计算 Top1 命中。
+    """
+    dataset = StreamingBacktestDataset(df, window=cfg.window)
+    loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_batch)
+    device = next(model.parameters()).device
+    model.eval()
+    red_hits = []
+    blue_hits = []
+    with torch.no_grad():
+        for src, tgt, combo, feats in loader:
+            src, tgt, combo, feats = src.to(device), tgt.to(device), combo.to(device), feats.to(device)
+            reds, blue = model(src, combo_ids=combo, feats=feats)
+            # blue top1
+            probs_b = torch.softmax(blue, dim=1)
+            pred_b = torch.argmax(probs_b, dim=1) + 1
+            blue_true = tgt[:, -1] - BLUE_OFFSET
+            blue_hits.extend((pred_b == blue_true).float().cpu().tolist())
+            # red top1 per position
+            for i, head_out in enumerate(reds):
+                probs_r = torch.softmax(head_out, dim=1)
+                pred_r = torch.argmax(probs_r, dim=1) + 1
+                red_true = tgt[:, i]
+                red_hits.extend((pred_r == red_true).float().cpu().tolist())
+    red_hit = float(np.mean(red_hits)) if red_hits else 0.0
+    blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
+    return {"red_top1": red_hit, "blue_top1": blue_hit, "samples": len(dataset)}
+
+
+class SeqPredictor(BasePredictor):
+    def __init__(self, config):
+        super().__init__(config)
+        self.cfg = TrainConfig(
+            window=config.window,
+            epochs=config.epochs,
+            batch_size=config.batch_size,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            num_layers=config.num_layers,
+            ff=config.ff,
+            dropout=config.dropout,
+            lr=config.lr,
+        )
+        self.model = None
+
+    def train(self, df: pd.DataFrame) -> None:
+        logger.info(f"Training SeqModel (window={self.cfg.window})...")
+        self.model, self.cfg = train_seq_model(
+            df, 
+            self.cfg, 
+            save_dir="models/Seq", 
+            resume=self.cfg.resume, 
+            fresh=self.cfg.fresh
+        )
+
+    def predict(self, df: pd.DataFrame) -> Dict[str, Any]:
+        if self.model is None:
+            raise RuntimeError("SeqModel not trained or loaded")
+        return predict_seq(self.model, self.cfg, df)
+
+    def save(self, save_dir: str) -> None:
+        path = Path(save_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        ckpt_path = _seq_ckpt_path(path, self.cfg)
+        if self.model:
+            torch.save(self.model.state_dict(), ckpt_path)
+            logger.info(f"SeqModel saved to {ckpt_path}")
+
+    def load(self, save_dir: str) -> bool:
+        path = Path(save_dir)
+        if not path.exists(): return False
+        
+        ckpt_path = _seq_ckpt_path(path, self.cfg)
+        if not ckpt_path.exists(): return False
+        
+        try:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # We need to rebuild the model structure to load weights
+            self.model = SeqModel(
+                d_model=self.cfg.d_model,
+                nhead=self.cfg.nhead,
+                num_layers=self.cfg.num_layers,
+                dim_feedforward=self.cfg.ff,
+                dropout=self.cfg.dropout,
+            ).to(device)
+            state = torch.load(ckpt_path, map_location=device, weights_only=True)
+            self.model.load_state_dict(state)
+            self.model.eval()
+            logger.info(f"SeqModel loaded from {ckpt_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load SeqModel: {e}")
+            return False
+
+

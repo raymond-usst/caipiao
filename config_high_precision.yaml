@@ -1,0 +1,73 @@
+db:
+  path: "data/ssq.db"
+recent: 2000
+sync: true
+
+cat:
+  enabled: true
+  window: 20
+  iterations: 1000
+  depth: 8
+  learning_rate: 0.05
+  fresh: true
+
+seq:
+  enabled: true
+  window: 30
+  epochs: 100
+  batch_size: 64
+  d_model: 128
+  nhead: 8
+  num_layers: 4
+  fresh: true
+
+tft:
+  enabled: true
+  window: 30
+  epochs: 100
+  fresh: true
+
+nhits:
+  enabled: true
+  max_steps: 1000
+  fresh: true
+
+timesnet:
+  enabled: true
+  max_steps: 1000
+  fresh: true
+
+prophet:
+  enabled: true
+  fresh: true
+
+gnn:
+  enabled: true
+  epochs: 500
+  fresh: true
+
+rl:
+  enabled: true
+  episodes: 5000
+  fresh: true
+
+esn:
+  enabled: true
+  reservoir_size: 1000
+  spectral_radius: 0.95
+  fresh: true
+
+bnn:
+  enabled: true
+  epochs: 500
+  hidden_dim: 128
+  fresh: true
+
+meta:
+  enabled: true
+  fresh: true
+
+blend:
+  enabled: true
+  train_size: 500
+  test_size: 30
