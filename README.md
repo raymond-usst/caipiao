@@ -60,29 +60,106 @@ pip install -r requirements.txt
 Fetch the latest lottery data from the internet.
 从互联网获取最新的彩票数据。
 ```bash
-python cli.py sync
+python main.py sync
 ```
 
 ### 3. Training / 训练模型
 Train all models in the ensemble (supports parallel execution).
 训练集成中的所有模型（支持并行执行）。
 ```bash
-python cli.py train-all
+python main.py train-all
 ```
 
 ### 4. Prediction / 预测
 Generate predictions for the next draw.
 生成下一期预测号码。
 ```bash
-python cli.py predict
+python main.py predict
 ```
 
 ### 5. Dashboard / 启动仪表盘
 Launch the interactive visualization interface.
 启动交互式可视化界面。
 ```bash
-python cli.py dashboard
+python dashboard.py
 ```
+
+---
+
+## 🛠️ CLI Arguments - `train-all` Parameters
+
+Use `python main.py train-all [ARGS]` to customize training.
+所有参数均为可选，支持详细配置。
+
+### 1. Global & Data / 全局与数据
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--db` | `data/ssq.db` | SQLite 数据库路径 |
+| `--sync` | False | 训练前自动同步最新数据 |
+| `--fresh` | False | **强制重训所有模型**（忽略断点，清空旧模型） |
+| `--recent` | 800 | 使用最近 N 期数据进行训练（建议 >= 800） |
+
+### 2. CatBoost Models
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--no-cat` | False | 跳过 CatBoost 训练 |
+| `--cat-window` | 10 | 特征滑窗长度 |
+| `--cat-iter` | 300 | 迭代轮数 (Trees) |
+| `--cat-depth` | 6 | 树深度 |
+| `--cat-lr` | 0.1 | 学习率 |
+| `--cat-fresh` | False | 强制重训 CatBoost |
+| `--cat-no-resume`| False | 不加载已保存模型 |
+| `--bayes-cat` | False | 开启贝叶斯超参数优化 |
+| `--bayes-cat-calls`| 8 | 贝叶斯搜索次数 |
+| `--pbt-cat` | False | 开启 PBT 演化训练 |
+
+### 3. Transformer (Seq2Seq)
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--no-seq` | False | 跳过 Transformer 训练 |
+| `--seq-window` | 20 | 序列滑窗长度 |
+| `--seq-epochs` | 20 | 训练轮数 |
+| `--seq-d-model` | 96 | 模型维度 |
+| `--seq-lr` | 1e-3 | 学习率 |
+| `--bayes-seq` | False | 开启 Transformer 贝叶斯调参 |
+| `--pbt-seq` | False | 开启 PBT 演化训练 |
+
+### 4. TFT (Temporal Fusion Transformer)
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--run-tft` | False | **开启 TFT 训练**（默认关闭） |
+| `--tft-window` | 20 | 输入窗口长度 |
+| `--tft-epochs` | 20 | 训练轮数 |
+| `--tft-batch` | 64 | Batch Size |
+| `--tft-lr` | 1e-3 | 学习率 |
+| `--bayes-tft` | False | 开启 TFT 贝叶斯调参 |
+| `--pbt-tft` | False | 开启 PBT 演化训练 |
+
+### 5. Advanced Time Series (N-HiTS / TimesNet / Prophet)
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--run-nhits` | False | 开启 N-HiTS 训练 |
+| `--nhits-steps` | 200 | 训练步数 |
+| `--run-timesnet` | False | 开启 TimesNet 训练 |
+| `--timesnet-steps`| 300 | 训练步数 |
+| `--run-prophet` | False | 开启 Prophet 训练 |
+| `--bayes-*` | False | 对应模型的贝叶斯调参 (e.g. `--bayes-nhits`) |
+| `--pbt-*` | False | 对应模型的 PBT 演化训练 (e.g. `--pbt-timesnet`) |
+
+### 6. PBT & Evolution Settings / PBT 演化配置
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--pbt-generations`| 5 | 演化代数（Generations） |
+| `--pbt-steps` | 50 | 每代训练步数 (Cat/N-HiTS/TimesNet) |
+| `--pbt-epochs` | 1 | 每代训练轮数 (Seq/TFT/Prophet) |
+
+### 7. Blender (Ensemble) / 模型融合
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--run-blend` | False | **开启模型融合**（推荐开启） |
+| `--blend-train` | 300 | 融合模型训练集窗口 |
+| `--blend-test` | 30 | 融合模型验证测试集大小 |
+| `--blend-step` | 30 | 滚动验证步长 |
 
 ---
 
@@ -127,7 +204,3 @@ This project is for **research and educational purposes only**. Lottery entails 
 
 **中文**:
 本项目仅供**研究和教育用途**。彩票具有巨大的风险，购买彩票属于博彩行为。本系统生成的预测基于历史数据和概率模型，**不能保证**中奖。对于使用本软件造成的任何经济损失，作者不承担任何责任。请理性购彩，量力而行。
-
----
-
-*Built with ❤️ by Deepmind Agentic AI*

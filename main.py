@@ -15,6 +15,32 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
+# Patch for tensorboard/numpy compatibility
+if not hasattr(np, "bool8"):
+    np.bool8 = np.bool_
+
+import logging
+# Suppress all Lightning logs including "Seed set to 42"
+class SeedFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        if "Seed set to" in msg:
+            return False
+        return True
+
+# Initialize logging to ensure handlers exist, then attach filter to ALL handlers
+logging.basicConfig(level=logging.ERROR)
+seed_filter = SeedFilter()
+logging.getLogger().addFilter(seed_filter)
+for handler in logging.getLogger().handlers:
+    handler.addFilter(seed_filter)
+
+# Also explicitly mute known noisy loggers
+for name in ["lightning", "pytorch_lightning", "lightning.fabric", "lightning.pytorch", "neuralforecast", "cmdstanpy"]:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.ERROR)
+    logger.addFilter(seed_filter)
+
 from lottery import analyzer, database, scraper, blender
 from lottery import ml_model, seq_model, tft_model, nhits_model, timesnet_model, prophet_model, validation, odd_model, sum_model, pbt
 
@@ -824,7 +850,7 @@ def _sync_if_needed(db_path: Path, do_sync: bool) -> None:
             print("[train-all] 数据库已最新，无需更新")
 
 
-def cmd_train_all(args) -> None:
+def cmd_train_all(args, cfg=None) -> None:
     db_path = Path(args.db)
     _sync_if_needed(db_path, args.sync)
     with database.get_conn(db_path) as conn:
@@ -844,15 +870,43 @@ def cmd_train_all(args) -> None:
             try:
                 from lottery.ml_model import CatModelAdapter
                 adapter = CatModelAdapter()
-                initial_configs = [
-                    {
-                        "window": args.cat_window,
-                        "depth": random.choice([4, 6, 8]),
-                        "learning_rate": random.choice([0.05, 0.1, 0.2]),
-                    }
-                    for _ in range(4)
-                ]
-                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=5, steps_per_gen=50, save_dir="models/pbt_cat")
+                if args.bayes_cat:
+                    print("[train-all][CatBoost] 启动贝叶斯 PBT 初始化...")
+                    try:
+                        _, best_params, best_score = ml_model.bayes_optimize_catboost(
+                            df, window=args.cat_window, n_iter=args.bayes_cat_calls, cv_splits=args.bayes_cat_cv, save_dir="models"
+                        )
+                        # Use best params to seed population with slight variation
+                        initial_configs = []
+                        base_depth = int(best_params.get("depth", 6))
+                        base_lr = float(best_params.get("learning_rate", 0.1))
+                        for _ in range(4):
+                            initial_configs.append({
+                                "window": args.cat_window,
+                                "depth": base_depth + random.choice([-1, 0, 1]) if base_depth > 1 else max(1, base_depth + random.choice([0, 1])),
+                                "learning_rate": base_lr * random.uniform(0.8, 1.2),
+                            })
+                        print(f"[train-all][CatBoost] 贝叶斯初始化完成: depth~{base_depth}, lr~{base_lr:.4f}")
+                    except Exception as e:
+                         print(f"[train-all][CatBoost][Bayes-Init] 失败，回退到随机: {e}")
+                         initial_configs = [
+                            {
+                                "window": args.cat_window,
+                                "depth": random.choice([4, 6, 8]),
+                                "learning_rate": random.choice([0.05, 0.1, 0.2]),
+                            }
+                            for _ in range(4)
+                        ]
+                else:
+                    initial_configs = [
+                        {
+                            "window": args.cat_window,
+                            "depth": random.choice([4, 6, 8]),
+                            "learning_rate": random.choice([0.05, 0.1, 0.2]),
+                        }
+                        for _ in range(4)
+                    ]
+                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=args.pbt_generations, steps_per_gen=max(50, args.pbt_steps), save_dir="models/pbt_cat")
                 runner.initialize(initial_configs)
                 best_member = runner.run()
                 models = best_member.model_state
@@ -883,7 +937,7 @@ def cmd_train_all(args) -> None:
                 except Exception as e:
                     print(f"[train-all][bayes-cat][warn] 调参失败，沿用手动参数: {e}")
             cat_resume = not args.cat_no_resume
-            cat_fresh = args.cat_fresh
+            cat_fresh = args.cat_fresh or args.fresh
             models = ml_model.train_models(
                 df,
                 window=args.cat_window,
@@ -909,21 +963,56 @@ def cmd_train_all(args) -> None:
             try:
                 from lottery.seq_model import SeqModelAdapter, TrainConfig
                 adapter = SeqModelAdapter()
-                initial_configs = [
-                    TrainConfig(
-                        window=args.seq_window,
-                        batch_size=64,
-                        epochs=1,
-                        lr=random.choice([1e-3, 5e-4]),
-                        d_model=96,
-                        nhead=4,
-                        num_layers=3,
-                        ff=192,
-                        dropout=0.1
-                    )
-                    for _ in range(4)
-                ]
-                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=5, steps_per_gen=5, save_dir="models/pbt_seq")
+                if args.bayes_seq:
+                    print("[train-all][Transformer] 启动贝叶斯 PBT 初始化...")
+                    try:
+                        bp, _ = seq_model.bayes_optimize_seq(df, recent=args.bayes_seq_recent, n_iter=args.bayes_seq_calls)
+                        initial_configs = []
+                        for _ in range(4):
+                            initial_configs.append(TrainConfig(
+                                window=int(bp["window"]),
+                                batch_size=int(bp["batch_size"]),
+                                epochs=1,
+                                lr=float(bp["lr"]) * random.uniform(0.8, 1.2),
+                                d_model=int(bp["d_model"]),
+                                nhead=int(bp["nhead"]),
+                                num_layers=int(bp["num_layers"]),
+                                ff=int(bp["ff"]),
+                                dropout=float(bp["dropout"])
+                            ))
+                        print(f"[train-all][Transformer] 贝叶斯初始化完成")
+                    except Exception as e:
+                        print(f"[train-all][Transformer][Bayes-Init] 失败，回退随机: {e}")
+                        initial_configs = [
+                            TrainConfig(
+                                window=args.seq_window,
+                                batch_size=64,
+                                epochs=1,
+                                lr=random.choice([1e-3, 5e-4]),
+                                d_model=96,
+                                nhead=4,
+                                num_layers=3,
+                                ff=192,
+                                dropout=0.1
+                            )
+                            for _ in range(4)
+                        ]
+                else:
+                    initial_configs = [
+                        TrainConfig(
+                            window=args.seq_window,
+                            batch_size=64,
+                            epochs=1,
+                            lr=random.choice([1e-3, 5e-4]),
+                            d_model=96,
+                            nhead=4,
+                            num_layers=3,
+                            ff=192,
+                            dropout=0.1
+                        )
+                        for _ in range(4)
+                    ]
+                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=args.pbt_generations, steps_per_gen=args.pbt_epochs, save_dir="models/pbt_seq")
                 runner.initialize(initial_configs)
                 best_member = runner.run()
                 model = best_member.model_state
@@ -975,7 +1064,7 @@ def cmd_train_all(args) -> None:
                 topk=3,
             )
             seq_resume = not args.seq_no_resume
-            seq_fresh = args.seq_fresh
+            seq_fresh = args.seq_fresh or args.fresh
             model, cfg = seq_model.train_seq_model(df, cfg, save_dir="models", resume=seq_resume, fresh=seq_fresh)
             preds = seq_model.predict_seq(model, cfg, df)
             print("[train-all][Transformer] 训练完成，最新窗口预测：")
@@ -992,19 +1081,49 @@ def cmd_train_all(args) -> None:
             try:
                 from lottery.tft_model import TftModelAdapter, TFTConfig
                 adapter = TftModelAdapter()
-                initial_configs = [
-                    TFTConfig(
-                         window=args.tft_window,
-                         batch=64,
-                         epochs=1,
-                         lr=random.choice([1e-3, 5e-4]),
-                         d_model=128,
-                         nhead=4,
-                         layers=3,
-                    )
-                    for _ in range(4)
-                ]
-                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=5, steps_per_gen=5, save_dir="models/pbt_tft")
+                # Check for Bayes/Random Tuning to init
+                if getattr(args, "bayes_tft", False):
+                     print("[train-all][TFT] 启动贝叶斯 PBT 初始化...")
+                     try:
+                         best_params, best_loss = tft_model.bayes_optimize_tft(
+                             df, recent=getattr(args, "bayes_tft_recent", 400), n_iter=getattr(args, "bayes_tft_calls", 10)
+                         )
+                         initial_configs = []
+                         base_lr = float(best_params["lr"])
+                         base_dr = float(best_params["dropout"])
+                         for _ in range(4):
+                             # Perturb slightly
+                             initial_configs.append(TFTConfig(
+                                 window=int(best_params["window"]),
+                                 batch=int(best_params["batch"]),
+                                 epochs=1,
+                                 lr=base_lr * random.uniform(0.8, 1.2),
+                                 d_model=int(best_params["d_model"]),
+                                 nhead=int(best_params["nhead"]),
+                                 layers=int(best_params["layers"]),
+                                 ff=int(best_params["ff"]),
+                                 dropout=base_dr,
+                             ))
+                         print(f"[train-all][TFT] 贝叶斯初始化完成: {best_params}")
+                     except Exception as e:
+                         print(f"[train-all][TFT][Bayes-Init] 失败: {e}")
+                         # Fallback to random
+                         initial_configs = []
+
+                if not initial_configs:
+                     initial_configs = [
+                        TFTConfig(
+                             window=args.tft_window,
+                             batch=64,
+                             epochs=1,
+                             lr=random.choice([1e-3, 5e-4]),
+                             d_model=128,
+                             nhead=4,
+                             layers=3,
+                        )
+                        for _ in range(4)
+                     ]
+                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=args.pbt_generations, steps_per_gen=args.pbt_epochs, save_dir="models/pbt_tft")
                 runner.initialize(initial_configs)
                 best_member = runner.run()
                 model = best_member.model_state
@@ -1033,7 +1152,7 @@ def cmd_train_all(args) -> None:
                 entropy_window=args.tft_entropy_window,
             )
             tft_resume = not args.tft_no_resume
-            tft_fresh = args.tft_fresh
+            tft_fresh = args.tft_fresh or args.fresh
             model, cfg = tft_model.train_tft(df, cfg, save_dir="models", resume=tft_resume, fresh=tft_fresh)
             preds = tft_model.predict_tft(model, cfg, df)
             print("[train-all][TFT] 训练完成，最新窗口预测：")
@@ -1050,17 +1169,39 @@ def cmd_train_all(args) -> None:
              try:
                  from lottery.nhits_model import NHitsModelAdapter, NHitsConfig
                  adapter = NHitsModelAdapter()
-                 initial_configs = [
-                     NHitsConfig(
-                         input_size=args.nhits_input,
-                         learning_rate=random.choice([1e-3, 5e-4]),
-                         max_steps=args.nhits_steps,
-                         batch_size=32,
-                         valid_size=0.1
-                     )
-                     for _ in range(4)
-                 ]
-                 runner = pbt.PBTRunner(adapter, df, population_size=4, generations=5, steps_per_gen=50, save_dir="models/pbt_nhits")
+                 if args.bayes_nhits:
+                      print("[train-all][N-HiTS] 启动贝叶斯 PBT 初始化...")
+                      try:
+                          best_params, best_loss = nhits_model.bayes_optimize_nhits(
+                              df, recent=getattr(args, "bayes_nhits_recent", 300), n_iter=getattr(args, "bayes_nhits_calls", 10)
+                          )
+                          initial_configs = []
+                          base_lr = float(best_params["learning_rate"])
+                          for _ in range(4):
+                              initial_configs.append(NHitsConfig(
+                                  input_size=int(best_params["input_size"]),
+                                  learning_rate=base_lr * random.uniform(0.8, 1.2),
+                                  max_steps=int(best_params["max_steps"]),
+                                  batch_size=int(best_params["batch_size"]),
+                                  valid_size=0.1
+                              ))
+                          print(f"[train-all][N-HiTS] 贝叶斯初始化完成: {best_params}")
+                      except Exception as e:
+                          print(f"[train-all][N-HiTS][Bayes-Init] 失败: {e}")
+                          initial_configs = []
+
+                 if not initial_configs:
+                     initial_configs = [
+                         NHitsConfig(
+                             input_size=args.nhits_input,
+                             learning_rate=random.choice([1e-3, 5e-4]),
+                             max_steps=args.nhits_steps,
+                             batch_size=32,
+                             valid_size=0.1
+                         )
+                         for _ in range(4)
+                     ]
+                 runner = pbt.PBTRunner(adapter, df, population_size=4, generations=args.pbt_generations, steps_per_gen=args.pbt_steps, save_dir="models/pbt_nhits")
                  runner.initialize(initial_configs)
                  best_member = runner.run()
                  nf = best_member.model_state
@@ -1086,7 +1227,7 @@ def cmd_train_all(args) -> None:
                 topk=3,
             )
             nh_resume = not getattr(args, "nhits_no_resume", False)
-            nh_fresh = getattr(args, "nhits_fresh", False)
+            nh_fresh = getattr(args, "nhits_fresh", False) or args.fresh
             nf, cfg = nhits_model.train_nhits(df, cfg, save_dir="models", resume=nh_resume, fresh=nh_fresh)
             preds = nhits_model.predict_nhits(nf, cfg, df)
             print(f"[train-all][N-HiTS] 训练完成，和值预测≈{preds['sum_pred']:.2f}，蓝球预测≈{preds['blue_pred']:.2f}")
@@ -1100,14 +1241,34 @@ def cmd_train_all(args) -> None:
             try:
                 from lottery.prophet_model import ProphetModelAdapter, ProphetConfig
                 adapter = ProphetModelAdapter()
-                initial_configs = [
-                    ProphetConfig(
-                        changepoint_prior_scale=random.choice([0.01, 0.05, 0.1]),
-                        seasonality_prior_scale=random.choice([1.0, 10.0])
-                    )
-                    for _ in range(4)
-                ]
-                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=3, steps_per_gen=1, save_dir="models/pbt_prophet")
+                if args.bayes_prophet:
+                    print("[train-all][Prophet] 启动贝叶斯 PBT 初始化...")
+                    try:
+                        best_params, best_score = prophet_model.bayes_optimize_prophet(
+                            df, recent=getattr(args, "bayes_prophet_recent", 200), n_iter=getattr(args, "bayes_prophet_calls", 10)
+                        )
+                        initial_configs = []
+                        base_cps = float(best_params["changepoint_prior_scale"])
+                        base_sps = float(best_params["seasonality_prior_scale"])
+                        for _ in range(4):
+                            initial_configs.append(ProphetConfig(
+                                changepoint_prior_scale=base_cps * random.uniform(0.8, 1.2),
+                                seasonality_prior_scale=base_sps * random.uniform(0.8, 1.2)
+                            ))
+                        print(f"[train-all][Prophet] 贝叶斯初始化完成: {best_params}")
+                    except Exception as e:
+                        print(f"[train-all][Prophet][Bayes-Init] 失败: {e}")
+                        initial_configs = []
+
+                if not initial_configs:
+                    initial_configs = [
+                        ProphetConfig(
+                            changepoint_prior_scale=random.choice([0.01, 0.05, 0.1]),
+                            seasonality_prior_scale=random.choice([1.0, 10.0])
+                        )
+                        for _ in range(4)
+                    ]
+                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=args.pbt_generations, steps_per_gen=args.pbt_epochs, save_dir="models/pbt_prophet")
                 runner.initialize(initial_configs)
                 best_member = runner.run()
                 models = best_member.model_state
@@ -1119,7 +1280,7 @@ def cmd_train_all(args) -> None:
             print("[train-all][Prophet] 训练中...")
             cfg = prophet_model.ProphetConfig()
             pr_resume = not getattr(args, "prophet_no_resume", False)
-            pr_fresh = getattr(args, "prophet_fresh", False)
+            pr_fresh = getattr(args, "prophet_fresh", False) or args.fresh
             models, cfg = prophet_model.train_prophet(df, cfg, save_dir="models", resume=pr_resume, fresh=pr_fresh)
             preds = prophet_model.predict_prophet(models, df)
             print(f"[train-all][Prophet] 训练完成，和值预测≈{preds['sum']:.2f}，蓝球预测≈{preds['blue']:.2f}")
@@ -1133,18 +1294,44 @@ def cmd_train_all(args) -> None:
             try:
                 from lottery.timesnet_model import TimesNetModelAdapter, TimesNetConfig
                 adapter = TimesNetModelAdapter()
-                initial_configs = [
-                    TimesNetConfig(
-                        input_size=args.timesnet_input,
-                        hidden_size=args.timesnet_hidden,
-                        learning_rate=random.choice([1e-3, 5e-4]),
-                        max_steps=args.timesnet_steps,
-                        batch_size=32,
-                        valid_size=0.1
-                    )
-                    for _ in range(4)
-                ]
-                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=5, steps_per_gen=50, save_dir="models/pbt_timesnet")
+                if args.bayes_timesnet:
+                    print("[train-all][TimesNet] 启动贝叶斯 PBT 初始化...")
+                    try:
+                        best_params, best_loss = timesnet_model.bayes_optimize_timesnet(
+                            df, recent=getattr(args, "bayes_timesnet_recent", 400), n_iter=getattr(args, "bayes_timesnet_calls", 10)
+                        )
+                        initial_configs = []
+                        base_lr = float(best_params["learning_rate"])
+                        base_dr = float(best_params["dropout"])
+                        for _ in range(4):
+                            initial_configs.append(TimesNetConfig(
+                                input_size=int(best_params["input_size"]),
+                                hidden_size=int(best_params["hidden_size"]),
+                                top_k=int(best_params["top_k"]),
+                                learning_rate=base_lr * random.uniform(0.8, 1.2),
+                                dropout=base_dr,
+                                max_steps=int(best_params["max_steps"]),
+                                batch_size=int(best_params["batch_size"]),
+                                valid_size=0.1
+                            ))
+                        print(f"[train-all][TimesNet] 贝叶斯初始化完成: {best_params}")
+                    except Exception as e:
+                        print(f"[train-all][TimesNet][Bayes-Init] 失败: {e}")
+                        initial_configs = []
+
+                if not initial_configs:
+                    initial_configs = [
+                        TimesNetConfig(
+                            input_size=args.timesnet_input,
+                            hidden_size=args.timesnet_hidden,
+                            learning_rate=random.choice([1e-3, 5e-4]),
+                            max_steps=args.timesnet_steps,
+                            batch_size=32,
+                            valid_size=0.1
+                        )
+                        for _ in range(4)
+                    ]
+                runner = pbt.PBTRunner(adapter, df, population_size=4, generations=args.pbt_generations, steps_per_gen=args.pbt_steps, save_dir="models/pbt_timesnet")
                 runner.initialize(initial_configs)
                 best_member = runner.run()
                 nf = best_member.model_state
@@ -1166,7 +1353,7 @@ def cmd_train_all(args) -> None:
                 valid_size=0.1,
             )
             tn_resume = not getattr(args, "timesnet_no_resume", False)
-            tn_fresh = getattr(args, "timesnet_fresh", False)
+            tn_fresh = getattr(args, "timesnet_fresh", False) or args.fresh
             nf, cfg = timesnet_model.train_timesnet(df, cfg, save_dir="models", resume=tn_resume, fresh=tn_fresh)
             preds = timesnet_model.predict_timesnet(nf, df)
             print(f"[train-all][TimesNet] 训练完成，和值预测≈{preds['sum_pred']:.2f}，蓝球预测≈{preds['blue_pred']:.2f}")
@@ -1212,9 +1399,20 @@ def cmd_train_all(args) -> None:
                 iterations=args.cat_iter,
                 depth=args.cat_depth,
                 learning_rate=args.cat_lr,
+                resume=not args.cat_no_resume,
+                fresh=args.cat_fresh or args.fresh
             )
 
+            # Pre-compute all predictions for Blender (Speed optimization)
+            print("[train-all][CatBoost] Batch predicting for Blender...")
+            cat_batch_preds = ml_model.batch_predict(cat_models, df, top_k=1)
+            
             def pred_cat(hist_df):
+                # O(1) lookup using absolute index
+                idx = hist_df.index[-1]
+                if idx in cat_batch_preds:
+                    return cat_batch_preds[idx]
+                # Fallback for unexpected cases
                 return ml_model.predict_next(cat_models, hist_df, top_k=1)
 
             base_predictors.append(pred_cat)
@@ -1234,10 +1432,16 @@ def cmd_train_all(args) -> None:
                 topk=1,
             )
             seq_resume = not args.seq_no_resume
-            seq_fresh = args.seq_fresh
+            seq_fresh = args.seq_fresh or args.fresh
             seq_m, seq_cfg = seq_model.train_seq_model(df, seq_cfg, save_dir="models", resume=seq_resume, fresh=seq_fresh)
 
+            print("[train-all][Transformer] Batch predicting for Blender...")
+            seq_batch_preds = seq_model.batch_predict_seq(seq_m, seq_cfg, df)
+            
             def pred_seq(hist_df):
+                idx = hist_df.index[-1]
+                if idx in seq_batch_preds:
+                    return seq_batch_preds[idx]
                 return seq_model.predict_seq(seq_m, seq_cfg, hist_df)
 
             base_predictors.append(pred_seq)
@@ -1262,7 +1466,13 @@ def cmd_train_all(args) -> None:
             tft_fresh = args.tft_fresh
             tft_m, tft_cfg = tft_model.train_tft(df, tft_cfg, save_dir="models", resume=tft_resume, fresh=tft_fresh)
 
+            print("[train-all][TFT] Batch predicting for Blender...")
+            tft_batch_preds = tft_model.batch_predict_tft(tft_m, tft_cfg, df)
+
             def pred_tft(hist_df):
+                idx = hist_df.index[-1]
+                if idx in tft_batch_preds:
+                    return tft_batch_preds[idx]
                 return tft_model.predict_tft(tft_m, tft_cfg, hist_df)
 
             base_predictors.append(pred_tft)
@@ -1287,7 +1497,13 @@ def cmd_train_all(args) -> None:
             nh_fresh = args.nhits_fresh
             nh_m, nh_cfg = nhits_model.train_nhits(df, nh_cfg, save_dir="models", resume=nh_resume, fresh=nh_fresh)
 
+            print("[train-all][N-HiTS] Batch predicting for Blender...")
+            nh_batch_preds = nhits_model.batch_predict_nhits(nh_m, nh_cfg, df)
+
             def pred_nh(hist_df):
+                idx = hist_df.index[-1]
+                if idx in nh_batch_preds:
+                    return nh_batch_preds[idx]
                 return nhits_model.predict_nhits(nh_m, nh_cfg, hist_df)
 
             base_predictors.append(pred_nh)
@@ -1315,7 +1531,13 @@ def cmd_train_all(args) -> None:
             tn_fresh = args.timesnet_fresh
             tn_m, tn_cfg = timesnet_model.train_timesnet(df, tn_cfg, save_dir="models", resume=tn_resume, fresh=tn_fresh)
 
+            print("[train-all][TimesNet] Batch predicting for Blender...")
+            tn_batch_preds = timesnet_model.batch_predict_timesnet(tn_m, tn_cfg, df)
+
             def pred_tn(hist_df):
+                idx = hist_df.index[-1]
+                if idx in tn_batch_preds:
+                    return tn_batch_preds[idx]
                 return timesnet_model.predict_timesnet(tn_m, hist_df)
 
             base_predictors.append(pred_tn)
@@ -1333,16 +1555,21 @@ def cmd_train_all(args) -> None:
             pr_fresh = args.prophet_fresh
             pr_m, pr_cfg = prophet_model.train_prophet(df, pr_cfg, save_dir="models", resume=pr_resume, fresh=pr_fresh)
 
-            def pred_pr(hist_df):
+            print("[train-all][Prophet] Batch predicting for Blender...")
+            pr_batch_preds = prophet_model.batch_predict_prophet(pr_m, df)
+
+            def pred_prophet(hist_df):
+                idx = hist_df.index[-1]
+                if idx in pr_batch_preds:
+                    return pr_batch_preds[idx]
                 return prophet_model.predict_prophet(pr_m, hist_df)
 
-
-            base_predictors.append(pred_pr)
+            base_predictors.append(pred_prophet)
 
         if len(base_predictors) < 2:
             print("[train-all][Blender] 基础模型不足2个，跳过融合")
         else:
-            blend_cfg = blender.BlendConfig(train_size=300, test_size=30, step=30, alpha=0.3, l1_ratio=0.1)
+            blend_cfg = blender.BlendConfig(train_size=args.blend_train, test_size=args.blend_test, step=args.blend_step, alpha=0.3, l1_ratio=0.1)
             # 蓝球
             avg_acc_b, folds_b = blender.rolling_blend_blue(df, base_predictors, cfg=blend_cfg)
             fused_num_b, fused_prob_b = blender.blend_blue_latest(df, base_predictors)
@@ -1354,7 +1581,13 @@ def cmd_train_all(args) -> None:
             # 红球位置
             avg_acc_r, folds_r = blender.rolling_blend_red(df, base_predictors, cfg=blend_cfg)
             fused_red = blender.blend_red_latest(df, base_predictors)
-            print(f"[train-all][Blender] 红球位置 Top1 平均命中率: {avg_acc_r:.3f} (折数 {len(folds_r)})，最新融合红球: {fused_red}")
+            # Format to {2, 4, 20, 18, 15, 14} style
+            fused_red_vals = list(fused_red.values())
+            # Ensure sorted by key if needed, or just values in P1-P6 order:
+            # blend_red_latest returns {pos: num}, pos is 1..6
+            fused_red_list = [fused_red[pos] for pos in sorted(fused_red.keys())]
+            fused_red_str = "{" + ", ".join(map(str, fused_red_list)) + "}"
+            print(f"[train-all][Blender] 红球位置 Top1 平均命中率: {avg_acc_r:.3f} (折数 {len(folds_r)})，最新融合红球: {fused_red_str}")
 
     print("[train-all] 执行完毕")
 
@@ -1614,6 +1847,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_train_all = sub.add_parser("train-all", help="一条命令依次训练 CatBoost / Transformer / TFT")
     p_train_all.add_argument("--db", default="data/ssq.db", help="SQLite 数据库路径")
     p_train_all.add_argument("--sync", action="store_true", help="训练前先同步数据")
+    p_train_all.add_argument("--fresh", action="store_true", help="强制重训所有模型并覆盖保存")
     p_train_all.add_argument("--recent", type=int, default=800, help="使用最近 N 期样本")
     # CatBoost
     p_train_all.add_argument("--no-cat", action="store_true", help="跳过 CatBoost 训练")
@@ -1686,6 +1920,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_train_all.add_argument("--pbt-prophet", action="store_true", help="使用 PBT 演化训练 Prophet")
     # Blender
     p_train_all.add_argument("--run-blend", action="store_true", help="开启融合（蓝球/和值/红球位置动态加权）")
+    p_train_all.add_argument("--blend-train", type=int, default=300, help="融合模型训练窗口大小")
+    p_train_all.add_argument("--blend-test", type=int, default=30, help="融合模型验证测试集大小")
+    p_train_all.add_argument("--blend-step", type=int, default=30, help="融合模型滚动步长")
     # TimesNet
     p_train_all.add_argument("--run-timesnet", action="store_true", help="开启 TimesNet 训练（和值+蓝球单变量）")
     p_train_all.add_argument("--timesnet-input", type=int, default=120, help="TimesNet 输入窗口")
@@ -1701,6 +1938,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_train_all.add_argument("--bayes-timesnet-recent", type=int, default=400, help="TimesNet 贝叶斯调参使用的最近样本数")
     p_train_all.add_argument("--timesnet-rand", action="store_true", help="启用 TimesNet 随机调参兜底")
     p_train_all.add_argument("--pbt-timesnet", action="store_true", help="使用 PBT 演化训练 TimesNet")
+    p_train_all.add_argument("--pbt-generations", type=int, default=5, help="PBT 演化代数")
+    p_train_all.add_argument("--pbt-steps", type=int, default=50, help="PBT 每代训练步数 (Cat/NHits/TimesNet)")
+    p_train_all.add_argument("--pbt-epochs", type=int, default=1, help="PBT 每代训练轮数 (Seq/TFT/Prophet)")
     p_train_all.set_defaults(func=cmd_train_all)
 
     p_pbt = sub.add_parser("train-pbt", help="使用 PBT (Population Based Training) 演化训练模型")

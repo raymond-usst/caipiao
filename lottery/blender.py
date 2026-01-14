@@ -104,9 +104,24 @@ def rolling_blend_blue(
     total = len(df)
     fold = 0
     acc_list = []
-    for start in range(0, total - cfg.train_size - cfg.test_size + 1, cfg.step):
-        train_df = df.iloc[start : start + cfg.train_size]
-        test_df = df.iloc[start + cfg.train_size : start + cfg.train_size + cfg.test_size]
+    
+    if total < cfg.train_size + cfg.test_size:
+         # Fallback: Just one fold with whatever we have
+         actual_test = min(cfg.test_size, int(total * 0.2))
+         actual_train = total - actual_test
+         # Mock iterator for single run
+         range_iter = [0]
+         # Define slicers
+         get_train = lambda s: df.iloc[:actual_train]
+         get_test = lambda s: df.iloc[actual_train:]
+    else:
+         range_iter = range(0, total - cfg.train_size - cfg.test_size + 1, cfg.step)
+         get_train = lambda s: df.iloc[s : s + cfg.train_size]
+         get_test = lambda s: df.iloc[s + cfg.train_size : s + cfg.train_size + cfg.test_size]
+
+    for start in range_iter:
+        train_df = get_train(start)
+        test_df = get_test(start)
         feat_train = _build_base_preds(train_df, base_predictors)
         feat_test = _build_base_preds(pd.concat([train_df, test_df]), base_predictors)
         if feat_train.empty or feat_test.empty:
@@ -145,9 +160,21 @@ def rolling_blend_sum(
     total = len(df)
     fold = 0
     maes = []
-    for start in range(0, total - cfg.train_size - cfg.test_size + 1, cfg.step):
-        train_df = df.iloc[start : start + cfg.train_size]
-        test_df = df.iloc[start + cfg.train_size : start + cfg.train_size + cfg.test_size]
+    
+    if total < cfg.train_size + cfg.test_size:
+         actual_test = min(cfg.test_size, int(total * 0.2))
+         actual_train = total - actual_test
+         range_iter = [0]
+         get_train = lambda s: df.iloc[:actual_train]
+         get_test = lambda s: df.iloc[actual_train:]
+    else:
+         range_iter = range(0, total - cfg.train_size - cfg.test_size + 1, cfg.step)
+         get_train = lambda s: df.iloc[s : s + cfg.train_size]
+         get_test = lambda s: df.iloc[s + cfg.train_size : s + cfg.train_size + cfg.test_size]
+
+    for start in range_iter:
+        train_df = get_train(start)
+        test_df = get_test(start)
         feat_train = _build_base_preds(train_df, base_predictors)
         feat_test = _build_base_preds(pd.concat([train_df, test_df]), base_predictors)
         if feat_train.empty or feat_test.empty:
@@ -181,9 +208,21 @@ def rolling_blend_red(
     fold = 0
     accs = []
     results = []
-    for start in range(0, total - cfg.train_size - cfg.test_size + 1, cfg.step):
-        train_df = df.iloc[start : start + cfg.train_size]
-        test_df = df.iloc[start + cfg.train_size : start + cfg.train_size + cfg.test_size]
+    
+    if total < cfg.train_size + cfg.test_size:
+         actual_test = min(cfg.test_size, int(total * 0.2))
+         actual_train = total - actual_test
+         range_iter = [0]
+         get_train = lambda s: df.iloc[:actual_train]
+         get_test = lambda s: df.iloc[actual_train:]
+    else:
+         range_iter = range(0, total - cfg.train_size - cfg.test_size + 1, cfg.step)
+         get_train = lambda s: df.iloc[s : s + cfg.train_size]
+         get_test = lambda s: df.iloc[s + cfg.train_size : s + cfg.train_size + cfg.test_size]
+
+    for start in range_iter:
+        train_df = get_train(start)
+        test_df = get_test(start)
         feat_train = _build_base_preds(train_df, base_predictors)
         feat_test = _build_base_preds(pd.concat([train_df, test_df]), base_predictors)
         if feat_train.empty or feat_test.empty:
@@ -229,7 +268,7 @@ def blend_blue_latest(
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     # 明确指定 multinomial，避免二分类歧义
-    clf = LogisticRegression(max_iter=500, multi_class='multinomial', solver='lbfgs')
+    clf = LogisticRegression(max_iter=500, solver='lbfgs')
     clf.fit(X_scaled, y)
     last_feat = X_scaled[-1].reshape(1, -1)
     proba = clf.predict_proba(last_feat)[0]

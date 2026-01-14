@@ -236,6 +236,8 @@ class TFTConfig:
     aux_sum_weight: float = 0.1
     aux_odd_weight: float = 0.1
     aux_span_weight: float = 0.1
+    resume: bool = True
+    fresh: bool = False
 
 
 def _tft_ckpt_path(save_dir: Path, cfg: TFTConfig) -> Path:
@@ -604,7 +606,7 @@ def train_tft(
     if len(dataset) < 10:
         raise ValueError("样本不足，无法训练 TFT")
     loader = DataLoader(dataset, batch_size=cfg.batch, shuffle=True, collate_fn=collate_tft)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")  # Force CPU to avoid GPU precision issues with large loss
     model = SimpleTFT(
         feature_dim=dataset[0][0].shape[-1],
         d_model=cfg.d_model,
@@ -620,19 +622,27 @@ def train_tft(
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
         if resume and not fresh and ckpt_path.exists():
             try:
-                state = torch.load(ckpt_path, map_location=device)
+                state = torch.load(ckpt_path, map_location=device, weights_only=True)
                 model.load_state_dict(state)
                 model.eval()
                 print(f"[TFT] 检测到已保存模型，直接加载 {ckpt_path}")
                 return model, cfg
+            except RuntimeError as e:
+                if "size mismatch" in str(e):
+                    print(f"[TFT] 模型特征维度不匹配，将重新训练")
+                else:
+                    print(f"[TFT] 加载已保存模型失败 ({e})，将重新训练")
             except Exception as e:
                 print(f"[TFT] 加载已保存模型失败，将重新训练: {e}")
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    def focal_loss(logits: torch.Tensor, target: torch.Tensor, gamma: float = 2.0) -> torch.Tensor:
+    def focal_loss(logits: torch.Tensor, target: torch.Tensor, gamma: float = 2.0, eps: float = 1e-7) -> torch.Tensor:
+        # Clamp logits to prevent overflow in softmax
+        logits = torch.clamp(logits, min=-50, max=50)
         log_probs = torch.log_softmax(logits, dim=1)
         probs = torch.exp(log_probs)
-        pt = probs.gather(1, target.unsqueeze(1)).squeeze(1)
-        log_pt = log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
+        # Clamp probabilities to prevent log(0)
+        pt = probs.gather(1, target.unsqueeze(1)).squeeze(1).clamp(min=eps, max=1-eps)
+        log_pt = torch.log(pt)
         loss = -((1 - pt) ** gamma) * log_pt
         return loss.mean()
     mse = nn.MSELoss()
@@ -662,11 +672,27 @@ def train_tft(
                 + cfg.aux_odd_weight * focal_loss(aux["odd"], odd_target)
                 + cfg.aux_span_weight * mse(aux["span"].squeeze(-1), span_target)
             )
+            # Skip NaN loss to prevent training collapse
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
             loss.backward()
+            # Gradient clipping to prevent explosion
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
+            # Also clip weights to prevent explosion
+            with torch.no_grad():
+                for param in model.parameters():
+                    param.clamp_(-10, 10)
             total_loss += loss.item()
             steps += 1
-        avg_loss = total_loss / max(1, steps)
+        if steps == 0:
+            print(f"[TFT] epoch {ep}, WARNING: all batches skipped due to NaN!")
+            # Don't update prev_loss or deltas, just continue
+            if ep > cfg.epochs * 2:  # Safety limit
+                print("[TFT] Too many epochs with no progress, stopping")
+                break
+            continue
+        avg_loss = total_loss / steps
         if prev_loss is not None:
             delta = abs(avg_loss - prev_loss)
             deltas.append(delta)
@@ -681,6 +707,10 @@ def train_tft(
         else:
             print(f"[TFT] epoch {ep}, loss={avg_loss:.4f}")
         prev_loss = avg_loss
+
+        if ep >= cfg.epochs:
+            print(f"[TFT] Reached max epochs {cfg.epochs}")
+            break
     model.eval()
     if ckpt_path is not None:
         torch.save(model.state_dict(), ckpt_path)
@@ -711,6 +741,80 @@ def predict_tft(model: SimpleTFT, cfg: TFTConfig, df: pd.DataFrame) -> Dict:
     top_idx_b = np.argsort(probs_b)[::-1][: cfg.topk]
     blue_preds = [(int(idx + 1), float(probs_b[idx])) for idx in top_idx_b]
     return {"red": red_preds, "blue": blue_preds}
+
+
+def batch_predict_tft(model: SimpleTFT, cfg: TFTConfig, df: pd.DataFrame) -> Dict[int, Dict]:
+    """
+    批量预测整个数据集（从 window 期开始）。
+    返回：{row_idx: result_dict}
+    优化：特征构建只做一次。
+    """
+    cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
+    data = df[cols].to_numpy(dtype=int)
+    window = cfg.window
+    if len(data) <= window:
+        return {}
+
+    # 1. 一次性构建所有特征
+    # feats_arr[i] features for row i
+    # Prediction for target i uses data[i-window:i] and feats[i-window:i]
+    # Actually wait. `_build_feature_matrix` is used as:
+    # hist = feats[i - window : i]
+    # Yes.
+    all_feats = _build_feature_matrix(df, freq_window=cfg.freq_window, entropy_window=cfg.entropy_window)
+    
+    results = {}
+    model.eval()
+    device = next(model.parameters()).device
+    
+    indices = range(window, len(data))
+    # Batch size usually larger for inference
+    batch_size = cfg.batch * 2
+    
+    import torch
+    
+    def process_batch(idxs):
+        batch_x = []
+        batch_combo = []
+        
+        for i in idxs:
+            # hist features for target i => [i-window : i]
+            hist = all_feats[i - window : i]
+            batch_x.append(hist)
+            
+            # combo based on LAST drawn red balls: seq[-1, :6]
+            # seq is data[i-window:i]. Last one is data[i-1]
+            last_reds = data[i-1, :6]
+            batch_combo.append(combo_hash(last_reds))
+            
+        x_t = torch.tensor(np.stack(batch_x), dtype=torch.float32).to(device)
+        c_t = torch.tensor(batch_combo, dtype=torch.long).to(device)
+        
+        with torch.no_grad():
+            reds, blue, _ = model(x_t, combo_ids=c_t)
+            
+        probs_r_list = [torch.softmax(r, dim=1).cpu().numpy() for r in reds]
+        probs_b = torch.softmax(blue, dim=1).cpu().numpy()
+        
+        for k, real_idx in enumerate(idxs):
+            row_res = {"red": {}, "blue": []}
+            # Red
+            for p in range(6):
+                probs = probs_r_list[p][k]
+                top_idx = np.argsort(probs)[::-1][:cfg.topk]
+                row_res["red"][p + 1] = [(int(idx + 1), float(probs[idx])) for idx in top_idx]
+            # Blue
+            b_p = probs_b[k]
+            top_b = np.argsort(b_p)[::-1][:cfg.topk]
+            row_res["blue"] = [(int(idx + 1), float(b_p[idx])) for idx in top_b]
+            
+            results[real_idx] = row_res
+
+    for start in range(0, len(indices), batch_size):
+        chunk = indices[start : start + batch_size]
+        process_batch(chunk)
+        
+    return results
 
 
 def backtest_tft_model(
@@ -869,6 +973,8 @@ class TFTPredictor(BasePredictor):
             dropout=config.dropout,
             freq_window=config.freq_window,
             entropy_window=config.entropy_window,
+            resume=getattr(config, 'resume', True),
+            fresh=getattr(config, 'fresh', False),
         )
         self.model = None
 

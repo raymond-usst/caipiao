@@ -28,9 +28,22 @@ def setup_logger(name: str = "lottery", log_file: str = "lottery.log", level: in
         if log_path.parent != Path("."):
             log_path.parent.mkdir(parents=True, exist_ok=True)
             
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
+
+    # Filter out "Seed set to" messages
+    class SeedFilter(logging.Filter):
+        def filter(self, record):
+            msg = record.getMessage()
+            if "Seed set to" in msg:
+                return False
+            return True
+            
+    seed_filter = SeedFilter()
+    logger.addFilter(seed_filter)
+    for handler in logger.handlers:
+        handler.addFilter(seed_filter)
 
     return logger
 

@@ -184,10 +184,13 @@ def _compute_features_internal(df: pd.DataFrame) -> pd.DataFrame:
     # We need to check 'draw_date'.
     
     if "draw_date" in pldf.columns:
-        if pldf["draw_date"].dtype == pl.Utf8:
-             dts = pldf["draw_date"].str.to_datetime("%Y-%m-%d", strict=False)
+        # Check if it's a string type (Utf8 or String)
+        dtype = pldf["draw_date"].dtype
+        if dtype == pl.Utf8 or dtype == pl.String or str(dtype).startswith("String") or str(dtype).startswith("Utf8"):
+            dts = pldf["draw_date"].str.to_datetime("%Y-%m-%d", strict=False)
         else:
-             dts = pldf["draw_date"]
+            # Already datetime or similar - use directly
+            dts = pldf["draw_date"]
              
         wd = dts.dt.weekday() - 1 # Polars 1..7 -> 0..6 to match Pandas
         
@@ -250,13 +253,21 @@ def _compute_features_internal(df: pd.DataFrame) -> pd.DataFrame:
     ])
         
     # Return as Pandas DataFrame because the rest of the app expects it
-    return res_pl.to_pandas()
+    # Drop non-numeric columns that might cause issues downstream
+    out_df = res_pl.to_pandas()
+    drop_cols = ["draw_date", "issue"]
+    out_df.drop(columns=[c for c in drop_cols if c in out_df.columns], inplace=True)
+    return out_df
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     构造宏观特征（带缓存）。
     """
-    return _store.load_or_compute(df, _compute_features_internal, suffix="macro_polars")
+    out_df = _store.load_or_compute(df, _compute_features_internal, suffix="macro_polars")
+    # Ensure non-numeric columns are dropped even if loaded from old cache
+    drop_cols = ["draw_date", "issue"]
+    out_df.drop(columns=[c for c in drop_cols if c in out_df.columns], inplace=True)
+    return out_df
 
 

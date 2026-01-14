@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
 import pickle
+import numpy as np
 
 import os
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
@@ -127,6 +128,8 @@ class TimesNetConfig:
     batch_size: int = 32
     valid_size: float = 0.1
     early_stop_patience_steps: int = 5  # 更敏感的基于 val loss 的早停
+    resume: bool = True
+    fresh: bool = False
 
 
 def _timesnet_ckpt_path(save_dir: Path, cfg: TimesNetConfig) -> Path:
@@ -723,7 +726,23 @@ def random_optimize_timesnet(
     }, float(best_loss)
 
 
+    return {
+        "sum_pred": sum_pred,
+        "blue_pred": blue_pred,
+        "blue_probs": blue_probs,
+        "red_probs": red_probs,
+    }
+
+
 def predict_timesnet(nf: NeuralForecast, df: pd.DataFrame) -> Dict[str, float]:
+    # TimesNet 需要一定的输入长度，若过短则返回默认值
+    if len(df) < 10: 
+        return {
+            "sum_pred": 100.0,
+            "blue_pred": 8.0,
+            "blue_probs": [(8, 1.0)],
+            "red_probs": [],
+        }
     ts = _build_timeseries(df)
     fcst = nf.predict(ts)
     sum_pred = float(fcst[fcst["unique_id"] == "sum"]["TimesNet"].iloc[-1])
@@ -738,6 +757,62 @@ def predict_timesnet(nf: NeuralForecast, df: pd.DataFrame) -> Dict[str, float]:
     }
 
 
+def batch_predict_timesnet(nf: NeuralForecast, cfg: TimesNetConfig, df: pd.DataFrame) -> Dict[int, Dict]:
+    """
+    Use cross_validation for batch predictions.
+    Identical logic to batch_predict_nhits but for TimesNet.
+    """
+    ts = _build_timeseries(df)
+    total_len = len(ts) // 2 
+    n_windows = total_len - cfg.input_size
+    if n_windows <= 0:
+        return {}
+
+    try:
+        cv_df = nf.cross_validation(
+            ts, 
+            n_windows=n_windows, 
+            step_size=1, 
+            val_size=1, 
+            refit=False
+        )
+    except Exception as e:
+        msg = str(e)
+        if "too short" in msg or "input size" in msg:
+            pass
+        else:
+            print(f"[TimesNet] Batch Predict Warning: {e}")
+        return {}
+    
+    blue_preds = cv_df[cv_df["unique_id"] == "blue"].set_index("ds")
+    sum_preds = cv_df[cv_df["unique_id"] == "sum"].set_index("ds")
+    
+    results = {}
+    dates = pd.to_datetime(df["draw_date"])
+    
+    for idx, date in enumerate(dates):
+        if idx < cfg.input_size: continue
+        
+        if date not in blue_preds.index:
+            continue
+            
+        try:
+            b_p = float(blue_preds.loc[date]["TimesNet"])
+            s_p = float(sum_preds.loc[date]["TimesNet"]) if date in sum_preds.index else 0.0
+            
+            blue_probs = _softmax_from_value(b_p, max_num=16, temperature=3.0)
+            
+            results[idx] = {
+                "sum_pred": s_p,
+                "blue_pred": b_p,
+                "blue_probs": blue_probs,
+            }
+        except TypeError:
+            continue
+            
+    return results
+
+
 def backtest_timesnet_model(
     nf: NeuralForecast,
     cfg: TimesNetConfig,
@@ -745,10 +820,10 @@ def backtest_timesnet_model(
     max_samples: int = 300,
 ) -> Dict[str, float]:
     """
-    流式回测：逐步截取历史->预测下一期蓝球，统计 Top1 命中率。
-    不重新训练，仅用已训模型做滑动预测，样本数默认限制以控制耗时。
+    流式回测：逐步截取历史->预测下一期蓝球，统计 Top1 命中率和 MAE。
     """
     blue_hits = []
+    mae_blue_list = []
     total = len(df)
     start_idx = max(cfg.input_size, total - max_samples)
     for i in range(start_idx, total - 1):
@@ -757,15 +832,18 @@ def backtest_timesnet_model(
         try:
             fcst = nf.predict(ts)
             blue_pred = float(fcst[fcst["unique_id"] == "blue"]["TimesNet"].iloc[-1])
-            blue_probs = _softmax_from_value(blue_pred, max_num=16)
-            top1 = blue_probs[0][0]
+            # Use rounding for Top1 accuracy in regression
+            top1 = int(round(blue_pred))
             true_b = int(df.iloc[i + 1]["blue"])
             blue_hits.append(1.0 if top1 == true_b else 0.0)
+            mae_blue_list.append(abs(blue_pred - true_b))
         except Exception:
             continue
     blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
-    blue_hit = float(np.mean(blue_hits)) if blue_hits else 0.0
-    return {"blue_top1": blue_hit, "samples": len(blue_hits)}
+    mae_blue = float(np.mean(mae_blue_list)) if mae_blue_list else 100.0
+    
+    score = 1.0 / (1.0 + mae_blue)
+    return {"blue_top1": blue_hit, "mae_blue": mae_blue, "score": score, "samples": len(blue_hits)}
 
 
 class TimesNetModelAdapter(ModelAdapter):
@@ -796,13 +874,15 @@ class TimesNetModelAdapter(ModelAdapter):
              nf = member.model_state
              
         for m in nf.models:
-             m.max_steps += 50
+            m.max_steps += 50
+            # Disable logger to prevent TensorBoard errors during PBT
+            m.trainer_kwargs["logger"] = False
              
         try:
             nf.fit(ts, val_size=val_size)
             
             dates = ts["ds"].unique()
-            dates.sort()
+            dates = np.sort(dates)
             val_dates = dates[-cfg.h:]
             cutoff_date = val_dates[0]
             
@@ -831,15 +911,18 @@ class TimesNetModelAdapter(ModelAdapter):
         nf = member.model_state
         if nf is None: return 0.0
         
-        if not getattr(nf, "fitted", False):
-            return 0.0
+        # if not getattr(nf, "fitted", False):
+        #     return 0.0
             
         cfg = member.config
         
         try:
             res = backtest_timesnet_model(nf, cfg, dataset, max_samples=60)
-            score = res["blue_top1"]
-        except Exception:
+            score = res["score"]
+        except Exception as e:
+            print(f"TimesNet Eval Error: {e}")
+            import traceback
+            traceback.print_exc()
             return 0.0
         return score
 
@@ -873,7 +956,9 @@ class TimesNetPredictor(BasePredictor):
             learning_rate=config.learning_rate,
             dropout=config.dropout,
             batch_size=32,
-            valid_size=0.1
+            valid_size=0.1,
+            resume=getattr(config, 'resume', True),
+            fresh=getattr(config, 'fresh', False),
         )
         self.model = None
 

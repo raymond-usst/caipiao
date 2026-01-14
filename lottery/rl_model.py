@@ -76,7 +76,7 @@ class RLPredictor(BasePredictor):
         self.cfg = config
         self.model = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.window = 10 
+        self.window = getattr(config, "window", 10)
 
     def train(self, df: pd.DataFrame) -> None:
         logger.info("Training RL Policy...")
@@ -96,7 +96,10 @@ class RLPredictor(BasePredictor):
         if not loaded:
             state_dim = self.window * 6
             self.model = PolicyNet(state_dim, self.cfg.hidden_size, action_dim=33).to(self.device)
-        
+            if len(data) <= self.window:
+                logger.warning(f"Not enough data for RL training ({len(data)} <= {self.window}). Skipping training.")
+                return
+
         self.model.train()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.cfg.learning_rate)
         

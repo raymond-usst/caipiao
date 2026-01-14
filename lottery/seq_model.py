@@ -27,7 +27,7 @@ RED_OFFSET = 0
 BLUE_OFFSET = 33  # reds: 1-33, blues will be offset to 34-49
 VOCAB_SIZE = 33 + 16 + 1  # +1 for padding
 COMBO_VOCAB = 20000  # 哈希桶，用于红球组合 embedding
-FEAT_DIM = 14  # 手工特征维度
+FEAT_DIM = 16  # 手工特征维度 (normalized, raw draw columns dropped)
 
 
 def encode_draw(row: np.ndarray) -> List[int]:
@@ -45,12 +45,31 @@ def combo_hash(reds: np.ndarray) -> int:
     return zlib.adler32(str(reds_sorted).encode("utf-8")) % COMBO_VOCAB
 
 
+def prepare_features(df: pd.DataFrame) -> np.ndarray:
+    """
+    Standardize feature preparation: build, filter non-numeric/raw, and normalize.
+    """
+    feats_df = build_features(df).select_dtypes(include='number')
+    # Drop columns that are just raw draw data (already in tokens)
+    drop_cols = ['issue', 'red1', 'red2', 'red3', 'red4', 'red5', 'red6', 'blue']
+    feats_df = feats_df.drop(columns=[c for c in drop_cols if c in feats_df.columns], errors='ignore')
+    # Z-score normalization
+    feats_arr = feats_df.to_numpy(dtype=float)
+    mean = feats_arr.mean(axis=0, keepdims=True)
+    std = feats_arr.std(axis=0, keepdims=True) + 1e-8  # Avoid div by zero
+    feats_arr = (feats_arr - mean) / std
+    return feats_arr
+
+
 class DrawDataset(Dataset):
     def __init__(self, df: pd.DataFrame, window: int = 20):
         cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
         data = df[cols].to_numpy(dtype=int)
-        feats_arr = build_features(df).to_numpy(dtype=float)
+        
+        feats_arr = prepare_features(df)
+        
         self.window = window
+
         self.samples = []
         for i in range(window, len(data)):
             hist = data[i - window : i]
@@ -59,7 +78,9 @@ class DrawDataset(Dataset):
             tgt_tokens = encode_draw(target)
             combo_id = combo_hash(target[:6])
             feat_vec = feats_arr[i]
+            feat_vec = feats_arr[i]
             self.samples.append((src_tokens, tgt_tokens, combo_id, feat_vec))
+        self.feature_dim = feats_arr.shape[1]
 
     def __len__(self):
         return len(self.samples)
@@ -102,7 +123,7 @@ class StreamingBacktestDataset(IterableDataset):
     def __iter__(self):
         cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
         data = self.df[cols].to_numpy(dtype=int)
-        feats_arr = build_features(self.df).to_numpy(dtype=float)
+        feats_arr = prepare_features(self.df)
         for i in range(self.window, len(data)):
             hist = data[i - self.window : i]
             target = data[i]
@@ -137,7 +158,7 @@ class PositionalEncoding(nn.Module):
 
 
 class SeqModel(nn.Module):
-    def __init__(self, d_model: int = 96, nhead: int = 4, num_layers: int = 3, dim_feedforward: int = 192, dropout: float = 0.1):
+    def __init__(self, d_model: int = 96, nhead: int = 4, num_layers: int = 3, dim_feedforward: int = 192, dropout: float = 0.1, feat_dim: int = 16):
         super().__init__()
         self.embed = nn.Embedding(VOCAB_SIZE, d_model, padding_idx=PAD_ID)
         self.pos = PositionalEncoding(d_model)
@@ -145,7 +166,8 @@ class SeqModel(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.combo_emb = nn.Embedding(COMBO_VOCAB, d_model)
-        self.feat_proj = nn.Linear(FEAT_DIM, d_model)
+
+        self.feat_proj = nn.Linear(feat_dim, d_model)
         self.head_red = nn.ModuleList([nn.Linear(d_model, 33) for _ in range(6)])
         self.head_blue = nn.Linear(d_model, 16)
 
@@ -177,6 +199,8 @@ class TrainConfig:
     ff: int = 192
     dropout: float = 0.1
     topk: int = 3
+    resume: bool = True
+    fresh: bool = False
 
 
 def _seq_ckpt_path(save_dir: Path, cfg: TrainConfig) -> Path:
@@ -214,6 +238,8 @@ def _quick_seq_loss(df: pd.DataFrame, cfg: TrainConfig, max_epochs: int = 6) -> 
         num_layers=cfg.num_layers,
         dim_feedforward=cfg.ff,
         dropout=cfg.dropout,
+
+        feat_dim=dataset.feature_dim,
     ).to(device)
     opt = Adam(model.parameters(), lr=cfg.lr)
     model.train()
@@ -384,6 +410,8 @@ def train_seq_model(
         num_layers=cfg.num_layers,
         dim_feedforward=cfg.ff,
         dropout=cfg.dropout,
+
+        feat_dim=dataset.feature_dim,
     ).to(device)
 
     ckpt_path = None
@@ -436,6 +464,10 @@ def train_seq_model(
         else:
             print(f"[Transformer] epoch {ep}, loss={avg_loss:.4f}")
         prev_loss = avg_loss
+
+        if ep >= cfg.epochs:
+            print(f"[Transformer] Reached max epochs {cfg.epochs}")
+            break
     model.eval()
     if ckpt_path is not None:
         torch.save(model.state_dict(), ckpt_path)
@@ -448,6 +480,10 @@ class SeqModelAdapter(ModelAdapter):
         # If model_state is None, initialize new model
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
+            
+        ds = DrawDataset(dataset, window=cfg.window)
+        loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_batch)
+        
         if member.model_state is None:
              model = SeqModel(
                 d_model=cfg.d_model,
@@ -455,13 +491,11 @@ class SeqModelAdapter(ModelAdapter):
                 num_layers=cfg.num_layers,
                 dim_feedforward=cfg.ff,
                 dropout=cfg.dropout,
+                feat_dim=ds.feature_dim,
             ).to(device)
         else:
             model = member.model_state.to(device)
             model.train()
-            
-        ds = DrawDataset(dataset, window=cfg.window)
-        loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_batch)
         opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
         
         # Train for 'steps' epochs
@@ -541,7 +575,7 @@ def predict_seq(model: SeqModel, cfg: TrainConfig, df: pd.DataFrame) -> Dict:
     seq = data[-cfg.window :]
     combo_id = combo_hash(seq[-1, :6])
     tokens = [t for draw in seq for t in encode_draw(draw)]
-    feats = build_features(df).iloc[-1].to_numpy(dtype=float)
+    feats = prepare_features(df)[-1]
     x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0)
     combo = torch.tensor([combo_id], dtype=torch.long)
     feats_t = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
@@ -558,6 +592,89 @@ def predict_seq(model: SeqModel, cfg: TrainConfig, df: pd.DataFrame) -> Dict:
     top_idx_b = np.argsort(probs_b)[::-1][: cfg.topk]
     blue_preds = [(int(idx + 1), float(probs_b[idx])) for idx in top_idx_b]
     return {"red": red_preds, "blue": blue_preds}
+
+
+def batch_predict_seq(model: SeqModel, cfg: TrainConfig, df: pd.DataFrame) -> Dict[int, Dict]:
+    """
+    批量预测整个数据集（从 window 期开始）。
+    返回：{row_idx: result_dict}
+    优化：特征构建只做一次。
+    """
+    cols = ["red1", "red2", "red3", "red4", "red5", "red6", "blue"]
+    data = df[cols].to_numpy(dtype=int)
+    window = cfg.window
+    if len(data) <= window:
+        return {}
+
+    # 1. 一次性构建所有特征
+    # feats_arr[i] corresponds to df.iloc[i] features
+    # Prediction for target at index `i` (df.iloc[i]) uses history ending at `i-1`.
+    # Specifically feats used are from `i-1`.
+    # predict_seq uses: feats = prepare_features(df)[-1] => features of last row.
+    all_feats = prepare_features(df).astype(np.float32)
+    
+    results = {}
+    model.eval()
+    device = next(model.parameters()).device
+    
+    # Indices to predict: from window to len(df)-1
+    # For index i (target row), input is data[i-window:i], feats[i-1]
+    
+    indices = range(window, len(data))
+    batch_size = cfg.batch_size * 2 # Increase batch for inference
+    
+    import torch
+    
+    # Helper to process a batch
+    def process_batch(idxs):
+        batch_x = []
+        batch_combo = []
+        batch_feats = []
+        
+        for i in idxs:
+            seq = data[i - window : i]
+            # tokens
+            tokens = [t for draw in seq for t in encode_draw(draw)]
+            batch_x.append(tokens)
+            
+            # combo hash
+            last_reds = seq[-1, :6]
+            batch_combo.append(combo_hash(last_reds))
+            
+            # feats: features of row i-1
+            batch_feats.append(all_feats[i-1])
+            
+        x_t = torch.tensor(batch_x, dtype=torch.long).to(device)
+        c_t = torch.tensor(batch_combo, dtype=torch.long).to(device)
+        f_t = torch.tensor(np.stack(batch_feats), dtype=torch.float32).to(device)
+        
+        with torch.no_grad():
+            reds, blue = model(x_t, combo_ids=c_t, feats=f_t)
+            
+        # Parse results
+        batch_probs_red = [torch.softmax(r, dim=1).cpu().numpy() for r in reds]
+        batch_probs_blue = torch.softmax(blue, dim=1).cpu().numpy()
+        
+        for k, real_idx in enumerate(idxs):
+            row_res = {"red": {}, "blue": []}
+            # Red
+            for p in range(6):
+                probs = batch_probs_red[p][k]
+                top_idx = np.argsort(probs)[::-1][:cfg.topk]
+                row_res["red"][p + 1] = [(int(idx + 1), float(probs[idx])) for idx in top_idx]
+            # Blue
+            b_probs = batch_probs_blue[k]
+            top_b = np.argsort(b_probs)[::-1][:cfg.topk]
+            row_res["blue"] = [(int(idx + 1), float(b_probs[idx])) for idx in top_b]
+            
+            results[real_idx] = row_res
+
+    # Iterate batches
+    for start in range(0, len(indices), batch_size):
+        chunk = indices[start : start + batch_size]
+        process_batch(chunk)
+        
+    return results
 
 
 def backtest_seq_model(
@@ -608,6 +725,8 @@ class SeqPredictor(BasePredictor):
             ff=config.ff,
             dropout=config.dropout,
             lr=config.lr,
+            resume=getattr(config, 'resume', True),
+            fresh=getattr(config, 'fresh', False),
         )
         self.model = None
 
@@ -644,14 +763,26 @@ class SeqPredictor(BasePredictor):
         try:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             # We need to rebuild the model structure to load weights
+            # We need to rebuild the model structure to load weights
+            # NOTE: We assume default feat_dim=16 here unless we save it in config. 
+            # Ideally config should store feat_dim, but for now let's infer or default.
+            # Actually, to be safe, we should load state first to inspect shapes? No.
+            # Let's try to infer from data df passed to predict? No df here.
+            # Assuming 16 or 23? It's risky. 
+            # Better: use state_dict['feat_proj.weight'].shape[1] after loading?
+            # But we need model to load state dict.
+            # TRICK: Load state dict first, check shape, then init model.
+            state = torch.load(ckpt_path, map_location=device, weights_only=True)
+            feat_dim = state['feat_proj.weight'].shape[1]
+            
             self.model = SeqModel(
                 d_model=self.cfg.d_model,
                 nhead=self.cfg.nhead,
                 num_layers=self.cfg.num_layers,
                 dim_feedforward=self.cfg.ff,
                 dropout=self.cfg.dropout,
+                feat_dim=feat_dim
             ).to(device)
-            state = torch.load(ckpt_path, map_location=device, weights_only=True)
             self.model.load_state_dict(state)
             self.model.eval()
             logger.info(f"SeqModel loaded from {ckpt_path}")

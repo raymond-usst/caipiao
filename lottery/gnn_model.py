@@ -83,7 +83,7 @@ class GATLayer(nn.Module):
 
 
 class LotteryGNN(nn.Module):
-    def __init__(self, num_nodes=33, hidden_dim=64, num_layers=2, dropout=0.5, use_gat=True):
+    def __init__(self, num_nodes=35, hidden_dim=64, num_layers=2, dropout=0.5, use_gat=True):
         super().__init__()
         self.embedding = nn.Embedding(num_nodes + 1, hidden_dim)  # 1-based indexing
         self.layers = nn.ModuleList()
@@ -100,7 +100,7 @@ class LotteryGNN(nn.Module):
         self.out = nn.Linear(hidden_dim, 1) 
 
     def forward(self, x, adj):
-        # x: Node indices [0, 1, ..., 33]
+        # x: Node indices [0, 1, ..., 34]
         h = self.embedding(x)
         for layer in self.layers:
             h = layer(h, adj)
@@ -197,7 +197,7 @@ class GNNPredictor(BasePredictor):
         # For simplicity in this GNN demo, we'll train with a static embedding 
         # but using 'recent' draws to optimize the embedding for 'next' prediction.
         
-        x = torch.arange(34).to(self.device) # Nodes 0-33
+        x = torch.arange(35).to(self.device) # Nodes 0-34 (node 34 = blue)
         
         # Training loop
         self.model.train()
@@ -208,7 +208,7 @@ class GNNPredictor(BasePredictor):
             
             for idx in indices:
                 target_nums = data[idx]
-                target = torch.zeros(34).to(self.device)
+                target = torch.zeros(35).to(self.device)
                 target[target_nums] = 1.0
                 # Mask 0 (unused)
                 target[0] = 0
@@ -216,8 +216,8 @@ class GNNPredictor(BasePredictor):
                 optimizer.zero_grad()
                 pred = self.model(x, self.adj_matrix)
                 
-                # loss computation (ignore index 0)
-                loss = criterion(pred[1:], target[1:])
+                # loss computation (ignore index 0, and handle dimension matching)
+                loss = criterion(pred[1:34], target[1:34])  # Only red balls 1-33
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
@@ -235,12 +235,12 @@ class GNNPredictor(BasePredictor):
         
         self.model.eval()
         with torch.no_grad():
-            x = torch.arange(34).to(self.device)
+            x = torch.arange(35).to(self.device)
             # Use stored adj matrix (assuming graph structure is relatively stable or built from train_df)
             if self.adj_matrix is None:
                 self._build_graph(df)
             
-            probs = self.model(x, self.adj_matrix).cpu().numpy()[1:] # 1-33
+            probs = self.model(x, self.adj_matrix).cpu().numpy()[1:34] # 1-33 (red balls)
             
         # Top red predictions
         top_indices = np.argsort(probs)[::-1]
@@ -272,7 +272,7 @@ class GNNPredictor(BasePredictor):
         if not path.exists(): return False
         try:
             self.model = LotteryGNN(
-                num_nodes=33, 
+                num_nodes=35, 
                 hidden_dim=self.cfg.hidden_channels, 
                 num_layers=self.cfg.num_layers, 
                 dropout=self.cfg.dropout

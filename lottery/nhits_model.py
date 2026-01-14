@@ -101,45 +101,72 @@ def backtest_nhits_model(
     nf: NeuralForecast,
     cfg: NHitsConfig,
     df: pd.DataFrame,
-    max_samples: int | None = None,
+    max_samples: int = 20,
 ) -> Dict[str, float]:
     """
-    轻量回测：使用已训练 N-HiTS 计算和值/蓝球 MAE，并估计蓝球 Top1 命中率。
-    可选截断最近 max_samples 期，避免全量预测过慢。
+    Rolling backtest: Predict last N steps one by one.
     """
     nf.eval() if hasattr(nf, "eval") else None
-    hist_df = df if not max_samples or max_samples <= 0 else df.tail(max_samples + cfg.input_size)
-    ts = _build_timeseries(hist_df)
-    fcst = nf.predict(ts)
-
-    pred_sum = fcst[fcst["unique_id"] == "sum"]["NHITS"].to_numpy()
-    pred_blue = fcst[fcst["unique_id"] == "blue"]["NHITS"].to_numpy()
-    y_sum = ts[ts["unique_id"] == "sum"]["y"].to_numpy()
-    y_blue = ts[ts["unique_id"] == "blue"]["y"].iloc[-len(pred_blue):].to_numpy()
     
-    # Alignment: pred_blue is forecast for [T-h+1 ... T] or similar horizon
-    # Ensure we compare same length from end of array
-    min_len_sum = min(len(pred_sum), len(y_sum))
-    # Align from the end
-    p_sum_aligned = pred_sum[-min_len_sum:]
-    y_sum_aligned = y_sum[-min_len_sum:]
+    hits = 0
+    total = 0
+    mae_sum = 0.0
+    mae_blue = 0.0
     
-    min_len_blue = min(len(pred_blue), len(y_blue))
-    p_blue_aligned = pred_blue[-min_len_blue:]
-    y_blue_aligned = y_blue[-min_len_blue:]
+    # We validate on [T-max_samples ... T]
+    # Ensure enough history
+    if len(df) < cfg.input_size + max_samples + 10:
+        return {"mae_sum": 0.0, "mae_blue": 0.0, "blue_top1": 0.0, "samples": 0}
 
-    mae_sum = float(np.mean(np.abs(p_sum_aligned - y_sum_aligned))) if min_len_sum else float("inf")
-    mae_blue = float(np.mean(np.abs(p_blue_aligned - y_blue_aligned))) if min_len_blue else float("inf")
+    loop_range = range(max_samples)
+    for i in loop_range:
+        # slice_end points to the target index (0-based from end is -1, -2...)
+        # But we want to predict row `target_idx`.
+        # Input should be everything UP TO `target_idx`.
+        
+        # Backward index: 0 means last row.
+        back_idx = i 
+        target_idx = len(df) - 1 - back_idx
+        
+        # Input DF: 0 ... target_idx - 1
+        input_df = df.iloc[:target_idx]
+        
+        if len(input_df) < cfg.input_size: continue
+        
+        target_row = df.iloc[target_idx]
+        true_sum = target_row[["red1", "red2", "red3", "red4", "red5", "red6", "blue"]].sum()
+        true_blue = target_row["blue"]
+        
+        ts = _build_timeseries(input_df)
+        
+        try:
+            fcst = nf.predict(ts)
+            
+            # Forecast is for target_idx (the next step after input_df)
+            p_sum = float(fcst[fcst["unique_id"] == "sum"]["NHITS"].iloc[0])
+            p_blue = float(fcst[fcst["unique_id"] == "blue"]["NHITS"].iloc[0])
+            
+            mae_sum += abs(p_sum - true_sum)
+            mae_blue += abs(p_blue - true_blue)
+            
+            # Top 1 Accuracy for Blue
+            # Use simple rounding for Top 1
+            if int(round(p_blue)) == int(true_blue):
+                hits += 1
+            
+            total += 1
+        except Exception:
+            pass
 
-
-    blue_hits = []
-    for pred, true in zip(pred_blue[-min_len_blue:], y_blue[-min_len_blue:]):
-        probs = _softmax_from_value(float(pred), max_num=16, temperature=3.0)
-        top1 = max(probs, key=lambda x: x[1])[0]
-        blue_hits.append(1.0 if top1 == int(round(true)) else 0.0)
-    blue_top1 = float(np.mean(blue_hits)) if blue_hits else 0.0
-
-    return {"mae_sum": mae_sum, "mae_blue": mae_blue, "blue_top1": blue_top1, "samples": min_len_blue}
+    avg_mae_sum = mae_sum / max(1, total)
+    avg_mae_blue = mae_blue / max(1, total)
+    acc = hits / max(1, total)
+    
+    # Return 1/(1+MAE) as the primary score for PBT to maximize
+    # This provides smoother gradients than sparse Top1 accuracy
+    score_blue = 1.0 / (1.0 + avg_mae_blue)
+    
+    return {"mae_sum": avg_mae_sum, "mae_blue": avg_mae_blue, "blue_top1": acc, "score": score_blue, "samples": total}
 
 
 def _softmax_from_value(val: float, max_num: int, temperature: float = 3.0):
@@ -180,6 +207,8 @@ class NHitsConfig:
     valid_size: float = 0.1  # 若 < h，会自动调至 >= h
     topk: int = 3
     early_stop_patience_steps: int = 5  # 更敏感的基于 val loss 的早停
+    resume: bool = True
+    fresh: bool = False
 
 
 def _nhits_ckpt_path(save_dir: Path, cfg: NHitsConfig) -> Path:
@@ -434,20 +463,126 @@ def train_nhits(
     return nf, cfg
 
 
-def predict_nhits(nf: NeuralForecast, cfg: NHitsConfig, df: pd.DataFrame) -> Dict:
-    ts = _build_timeseries(df)
-    fcst = nf.predict(ts)
-    # 取最后一条预测
-    sum_pred = float(fcst[fcst["unique_id"] == "sum"]["NHITS"].iloc[-1])
-    blue_pred = float(fcst[fcst["unique_id"] == "blue"]["NHITS"].iloc[-1])
-    blue_probs = _softmax_from_value(blue_pred, max_num=16, temperature=3.0)
-    red_probs = _freq_probs(df, max_num=33)  # 频率先验给出红球分布
     return {
         "sum_pred": sum_pred,
         "blue_pred": blue_pred,
         "blue_probs": blue_probs,
         "red_probs": red_probs,
     }
+
+
+def predict_nhits(nf: NeuralForecast, cfg: NHitsConfig, df: pd.DataFrame) -> Dict:
+    if len(df) < cfg.input_size:
+        # Avoid crash on short history
+        return {
+            "sum_pred": 100.0,
+            "blue_pred": 8.0,
+            "blue_probs": [(8, 1.0)],
+            "red_probs": [],
+        }
+    ts = _build_timeseries(df)
+    fcst = nf.predict(ts)
+    sum_pred = float(fcst[fcst["unique_id"] == "sum"]["NHITS"].iloc[-1])
+    blue_pred = float(fcst[fcst["unique_id"] == "blue"]["NHITS"].iloc[-1])
+    blue_probs = _softmax_from_value(blue_pred, max_num=16, temperature=3.0)
+    red_probs = _freq_probs(df, max_num=33)
+    return {
+        "sum_pred": sum_pred,
+        "blue_pred": blue_pred,
+        "blue_probs": blue_probs,
+        "red_probs": red_probs,
+    }
+
+
+def batch_predict_nhits(nf: NeuralForecast, cfg: NHitsConfig, df: pd.DataFrame) -> Dict[int, Dict]:
+    """
+    Use cross_validation to efficiently generate rolling predictions.
+    Avoids re-calculating features N times.
+    """
+    ts = _build_timeseries(df)
+    total_len = len(ts) // 2 # 2 unique_ids
+    n_windows = total_len - cfg.input_size
+    if n_windows <= 0:
+        return {}
+
+    # Use cross_validation to get extensive backtests
+    # step_size=1 means rolling forecast for every day
+    try:
+        cv_df = nf.cross_validation(
+            ts, 
+            n_windows=n_windows, 
+            step_size=1, 
+            val_size=1, # Forecast 1 step ahead
+            refit=False # Important: Don't refit!
+        )
+    except Exception as e:
+        msg = str(e)
+        if "too short" in msg or "input size" in msg:
+            # Data too short for batch prediction, safe to skip (will fallback)
+            pass
+        else:
+            print(f"[N-HiTS] Batch Predict Warning: {e}")
+        return {}
+
+    # cv_df cols: [unique_id, ds, cutoff, NHITS, y]
+    # We need to map back to original df index.
+    # unique_id="blue" rows are what we care about mostly (and sum)
+    
+    results = {}
+    
+    # Pre-calculate Red Freq Probs (Static/Global or rolling?)
+    # Ideally rolling, but expensive. Use global or simple approximation?
+    # Simple approximation: standard freq probs from *current* df history?
+    # Actually, blending just needs `blue_probs` mainly.
+    # We will compute freq probs only once or per row? 
+    # Use freq of FULL df for simplicity (minor leak) or just omit red?
+    # Blender uses red probs if available.
+    # We can use `_freq_probs` but it's expensive to re-compute.
+    # Let's cache it? No, blender needs it per row.
+    # Let's skip red probs or use trivial ones. 
+    # Or optimize `_freq_probs`: sliding update?
+    # For now, omit red_probs to save time, or use static.
+    # NHits is mostly for Blue/Sum.
+    
+    # Map dates to indices?
+    # df has no daily freq guaratee, but assumed linear.
+    # `ds` in cv_df matches `ds` in `ts`.
+    
+    # Group by cutoff or ds?
+    # cutoff is T-1, ds is T (forecast target).
+    # We want result for row T.
+    
+    # Extract predictions
+    blue_preds = cv_df[cv_df["unique_id"] == "blue"].set_index("ds")
+    sum_preds = cv_df[cv_df["unique_id"] == "sum"].set_index("ds")
+    
+    # Iterate original df
+    dates = pd.to_datetime(df["draw_date"])
+    
+    for idx, date in enumerate(dates):
+        if idx < cfg.input_size: continue
+        
+        # Check if we have prediction for this date
+        if date not in blue_preds.index:
+            continue
+            
+        try:
+            b_p = float(blue_preds.loc[date]["NHITS"])
+            s_p = float(sum_preds.loc[date]["NHITS"]) if date in sum_preds.index else 0.0
+            
+            blue_probs = _softmax_from_value(b_p, max_num=16, temperature=3.0)
+            
+            results[idx] = {
+                "sum_pred": s_p,
+                "blue_pred": b_p,
+                "blue_probs": blue_probs,
+                #"red_probs": ... # Optional
+            }
+        except TypeError:
+            # Duplicate index potentially?
+            continue
+            
+    return results
 
 
 class NHitsModelAdapter(ModelAdapter):
@@ -469,6 +604,11 @@ class NHitsModelAdapter(ModelAdapter):
                     hist_exog_list=FEAT_COLS,
                 )
             ]
+             for m in models:
+                 if hasattr(m, "trainer_kwargs"):
+                     m.trainer_kwargs["logger"] = False
+                     m.trainer_kwargs["enable_progress_bar"] = False
+                     m.trainer_kwargs["enable_model_summary"] = False
              nf = NeuralForecast(models=models, freq="D")
         else:
              nf = member.model_state
@@ -485,8 +625,7 @@ class NHitsModelAdapter(ModelAdapter):
             # we should provide input up to T-h.
             # But TS DataFrame is stacked.
             # Let's filter by date?
-            dates = ts["ds"].unique()
-            dates.sort()
+            dates = np.sort(ts["ds"].unique())
             val_dates = dates[-cfg.h:]
             cutoff_date = val_dates[0]
             
@@ -524,20 +663,18 @@ class NHitsModelAdapter(ModelAdapter):
         nf = member.model_state
         if nf is None: return 0.0
         # Check if fitted (handle potential training failure gracefully)
-        if not getattr(nf, "fitted", False):
-            # Try to infer from private attribute if 'fitted' property missing?
-            # Or just return 0.0
-            # Check if models inside are fitted?
-            # Assuming if fit() succeeded, fitted is True.
-            return 0.0
+        # if not getattr(nf, "fitted", False):
+        #    return 0.0
             
         cfg = member.config
         
         try:
             res = backtest_nhits_model(nf, cfg, dataset, max_samples=60)
-            score = res["blue_top1"]
+            score = res["score"]
         except Exception as e:
             print(f"NHits Eval Error: {e}")
+            import traceback
+            traceback.print_exc()
             return 0.0
         return score
 
@@ -568,7 +705,9 @@ class NHitsPredictor(BasePredictor):
             learning_rate=config.learning_rate,
             max_steps=config.max_steps,
             batch_size=32,
-            valid_size=0.1
+            valid_size=0.1,
+            resume=getattr(config, 'resume', True),
+            fresh=getattr(config, 'fresh', False),
         )
         self.model = None
 

@@ -107,6 +107,7 @@ class GNNConfig:
 @dataclass
 class RLConfig:
     enabled: bool = False
+    window: int = 10
     hidden_size: int = 128
     learning_rate: float = 1e-3
     gamma: float = 0.99

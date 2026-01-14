@@ -24,6 +24,12 @@ import pandas as pd
 from prophet import Prophet
 import numpy as np
 import logging
+import cmdstanpy
+# Explicitly set cmdstanpy logger to ERROR to suppress INFO logs
+cmdstanpy.utils.get_logger().setLevel(logging.ERROR)
+# Also try standard logging getLogger
+logging.getLogger("cmdstanpy").setLevel(logging.ERROR)
+logging.getLogger("cmdstanpy").propagate = False
 from .features import build_features
 from .pbt import ModelAdapter, Member
 import copy
@@ -270,6 +276,9 @@ def train_prophet(
     return models, cfg
 
 
+    return {**future, **probs}
+
+
 def predict_prophet(models: Dict[str, Prophet], df: pd.DataFrame) -> Dict[str, float]:
     future = {}
     probs = {}
@@ -284,7 +293,6 @@ def predict_prophet(models: Dict[str, Prophet], df: pd.DataFrame) -> Dict[str, f
         if uid == "blue":
             classes = np.arange(1, 17, dtype=float)
             logits = -((classes - yhat) / 3.0) ** 2
-
             logits = logits - logits.max()
             p = np.exp(logits)
             p = p / p.sum()
@@ -299,6 +307,106 @@ def predict_prophet(models: Dict[str, Prophet], df: pd.DataFrame) -> Dict[str, f
             classes_r = np.arange(1, 34, dtype=int)
             probs["red_probs"] = [(int(c), float(pp)) for c, pp in zip(classes_r, pr)]
     return {**future, **probs}
+
+
+def batch_predict_prophet(models: Dict[str, Prophet], df: pd.DataFrame) -> Dict[int, Dict]:
+    """
+    批量预测整个数据集（Prophet 版本）。
+    为了避免 cmdstanpy 在 Windows 下的大数据量 IPC 卡死问题，
+    采用分块（Chunk）预测，并打印进度。
+    """
+    feats = build_features(df)
+    dates = pd.to_datetime(df["draw_date"])
+    
+    # 构造 future：包含 ds 和所有 regressors
+    future_base = pd.DataFrame({"ds": dates})
+    for c in FEAT_COLS:
+        future_base[c] = feats[c].to_numpy()
+        
+    results = {}
+    n = len(df)
+    
+    # 预计算全局红球概率（近似）
+    cols = ["red1", "red2", "red3", "red4", "red5", "red6"]
+    all_reds = df[cols].to_numpy(dtype=int).ravel()
+    counts = np.bincount(all_reds, minlength=34)[1:]
+    logits_r = counts.astype(float)
+    logits_r = logits_r - logits_r.max()
+    pr = np.exp(logits_r)
+    pr = pr / pr.sum()
+    classes_r = np.arange(1, 34, dtype=int)
+    global_red_probs = [(int(c), float(pp)) for c, pp in zip(classes_r, pr)]
+
+    # 分块参数
+    chunk_size = 200
+    total_chunks = (n + chunk_size - 1) // chunk_size
+    
+    # Suppress internal prophet logging
+    logging.getLogger("prophet").setLevel(logging.CRITICAL)
+    logging.getLogger("cmdstanpy").setLevel(logging.CRITICAL)
+
+    print(f"[Prophet] 开始批量预测 {n} 期数据，分 {total_chunks} 块执行...")
+
+    # Blue
+    m_blue = models["blue"]
+    yhat_blue = np.zeros(n)
+    
+    for i in range(0, n, chunk_size):
+        end = min(i + chunk_size, n)
+        chunk_df = future_base.iloc[i:end]
+        print(f"[Prophet] Predicting Blue chunk {i//chunk_size + 1}/{total_chunks} ({i}-{end})...")
+        try:
+            # 必须捕获异常防止整个流程卡死
+            fcst = m_blue.predict(chunk_df)
+            yhat_blue[i:end] = fcst["yhat"].to_numpy()
+        except Exception as e:
+            print(f"[Prophet][Error] Blue chunk {i}-{end} failed: {e}")
+            # 失败填充最后已知值或0
+            yhat_blue[i:end] = yhat_blue[i-1] if i > 0 else 8.0
+
+    # Sum
+    yhat_sum = None
+    if "sum" in models:
+        m_sum = models["sum"]
+        yhat_sum = np.zeros(n)
+        for i in range(0, n, chunk_size):
+            end = min(i + chunk_size, n)
+            chunk_df = future_base.iloc[i:end]
+            # print(f"[Prophet] Predicting Sum chunk {i//chunk_size + 1}/{total_chunks}...")
+            try:
+                fcst = m_sum.predict(chunk_df)
+                yhat_sum[i:end] = fcst["yhat"].to_numpy()
+            except Exception as e:
+                print(f"[Prophet][Error] Sum chunk {i}-{end} failed: {e}")
+                yhat_sum[i:end] = yhat_sum[i-1] if i > 0 else 100.0
+
+    print("[Prophet] 批量预测完成，封装结果...")
+
+    # 封装结果
+    for i in range(n):
+        res = {}
+        # Blue
+        val_b = float(yhat_blue[i])
+        res["blue_pred"] = val_b
+        
+        # Softmax for blue
+        classes = np.arange(1, 17, dtype=float)
+        logits = -((classes - val_b) / 3.0) ** 2
+        logits = logits - logits.max()
+        p = np.exp(logits)
+        p = p / p.sum()
+        res["blue_probs"] = [(int(c), float(pp)) for c, pp in zip(classes.astype(int), p)]
+        
+        # Sum
+        if yhat_sum is not None:
+             res["sum_pred"] = float(yhat_sum[i])
+             
+        # Red
+        res["red_probs"] = global_red_probs
+        
+        results[i] = res
+        
+    return results
 
 
 class ProphetModelAdapter(ModelAdapter):

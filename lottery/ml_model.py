@@ -42,11 +42,13 @@ def _prepare_dataset(df: pd.DataFrame, window: int = 10):
         reds_bytes = str(tuple(sorted(int(x) for x in last_reds))).encode("utf-8")
         combo_id = zlib.adler32(reds_bytes)
 
-        window_slice = np.concatenate([window_slice, np.array([combo_id], dtype=int), feats_arr[i]])
+        window_slice = np.concatenate([window_slice, np.array([combo_id], dtype=int), feats_arr[i - 1]])
         X_list.append(window_slice)
         for p in range(6):
             y_red[p].append(data[i][p])
         y_blue.append(data[i][6])
+    if not X_list:
+        raise ValueError(f"No samples generated. Data length ({len(data)}) <= window ({window})")
     X = np.stack(X_list)
     y_blue = np.array(y_blue)
     y_red = {k: np.array(v) for k, v in y_red.items()}
@@ -223,19 +225,30 @@ def train_models(
         params["use_best_model"] = False
         params["od_type"] = None
 
+    def _fit_safe(model, X, y, eval_set=None):
+        u = np.unique(y)
+        sample_weight = None
+        if len(u) < 2:
+            dummy_y = 1 if u[0] != 1 else 2
+            X = np.vstack([X, X[0:1]])
+            y = np.append(y, [dummy_y])
+            sample_weight = np.ones(len(y))
+            sample_weight[-1] = 0.0
+        model.fit(X, y, sample_weight=sample_weight, eval_set=eval_set)
+
     for p in range(6):
         model = CatBoostClassifier(**params)
         if val_ok:
-            model.fit(X_train, y_train[p], eval_set=(X_val, y_val[p]))
+            _fit_safe(model, X_train, y_train[p], eval_set=(X_val, y_val[p]))
         else:
-            model.fit(X_train, y_train[p])
+            _fit_safe(model, X_train, y_train[p])
         models_red[p] = model
 
     blue_model = CatBoostClassifier(**params)
     if val_ok:
-        blue_model.fit(X_train, y_train_blue, eval_set=(X_val, y_val_blue))
+        _fit_safe(blue_model, X_train, y_train_blue, eval_set=(X_val, y_val_blue))
     else:
-        blue_model.fit(X_train, y_blue)
+        _fit_safe(blue_model, X_train, y_train_blue)
     # 保存
     if save_path is not None:
         for p, m in models_red.items():
@@ -268,14 +281,71 @@ def predict_next(models: dict, df: pd.DataFrame, top_k: int = 3):
     for p, model in models["red"].items():
         proba = model.predict_proba(x)[0]
         top_idx = np.argsort(proba)[::-1][:top_k]
-        red_preds[p + 1] = [(int(i), float(proba[i])) for i in top_idx]
+        red_preds[p + 1] = [(int(model.classes_[i]), float(proba[i])) for i in top_idx]
 
     blue_model = models["blue"]
     proba_b = blue_model.predict_proba(x)[0]
     top_idx_b = np.argsort(proba_b)[::-1][:top_k]
-    blue_preds = [(int(i), float(proba_b[i])) for i in top_idx_b]
-    blue_preds = [(int(i), float(proba_b[i])) for i in top_idx_b]
+    blue_preds = [(int(blue_model.classes_[i]), float(proba_b[i])) for i in top_idx_b]
     return {"red": red_preds, "blue": blue_preds}
+
+
+def batch_predict(models: dict, df: pd.DataFrame, top_k: int = 3) -> Dict[int, Dict]:
+    """
+    批量预测整个数据集的每一期（从 window 期开始）。
+    返回：{row_idx: result_dict}
+    用于 Blender 快速特征构建，避免重复计算特征。
+    """
+    window = models["window"]
+    if len(df) <= window:
+        return {}
+    
+    # 复用 _prepare_dataset 构建特征矩阵 X
+    # X 的第 k 行对应 df 的第 window + k 行作为 target
+    # 即使用 df[:window+k] 预测 df[window+k]
+    try:
+        X, _, _ = _prepare_dataset(df, window=window)
+    except ValueError:
+        return {}
+
+    # 批量预测
+    results = {}
+    
+    # 红球
+    red_probas = {} # pos -> (n_samples, n_classes)
+    red_classes = {}
+    for p, model in models["red"].items():
+        red_probas[p] = model.predict_proba(X)
+        red_classes[p] = model.classes_
+        
+    # 蓝球
+    blue_model = models["blue"]
+    blue_proba = blue_model.predict_proba(X)
+    blue_classes = blue_model.classes_
+    
+    n_samples = len(X)
+    # X[0] corresponds to strict history df[:window], target is df.iloc[window]
+    # So index in df is window + k
+    
+    for k in range(n_samples):
+        df_idx = window + k
+        row_res = {"red": {}, "blue": []}
+        
+        # Red
+        for p in range(6):
+            # pos p (0-5) -> 1-6
+            proba = red_probas[p][k]
+            top_idx = np.argsort(proba)[::-1][:top_k]
+            row_res["red"][p + 1] = [(int(red_classes[p][i]), float(proba[i])) for i in top_idx]
+            
+        # Blue
+        b_p = blue_proba[k]
+        top_b = np.argsort(b_p)[::-1][:top_k]
+        row_res["blue"] = [(int(blue_classes[i]), float(b_p[i])) for i in top_b]
+        
+        results[df_idx] = row_res
+        
+    return results
 
 
 class CatModelAdapter(ModelAdapter):
@@ -311,6 +381,17 @@ class CatModelAdapter(ModelAdapter):
 
         # Helper to train one model
         def train_one(model, X, y, p_name):
+            # Check unique classes
+            u = np.unique(y)
+            sample_weight = None
+            if len(u) < 2:
+                # Add dummy sample with 0 weight to avoid "Target contains only one unique value"
+                dummy_y = 1 if u[0] != 1 else 2
+                X = np.vstack([X, X[0:1]])
+                y = np.append(y, [dummy_y])
+                sample_weight = np.ones(len(y))
+                sample_weight[-1] = 0.0
+
             # Check if we can continue
             init_model = None
             if model is not None:
@@ -323,15 +404,19 @@ class CatModelAdapter(ModelAdapter):
                         init_model = model
                 except:
                     init_model = model # Attempt to use it
+                    
+            # CatBoost GPU does not support continuation with init_model yet
+            if params.get("task_type") == "GPU":
+                init_model = None
             
             # If init_model is None (restarting), we need to set iterations = target_iter
             new_model = CatBoostClassifier(**params)
             try:
-                new_model.fit(X, y, init_model=init_model)
+                new_model.fit(X, y, init_model=init_model, sample_weight=sample_weight)
             except Exception:
                 # Fallback: train from scratch if init failed
                 new_model = CatBoostClassifier(**params)
-                new_model.fit(X, y)
+                new_model.fit(X, y, sample_weight=sample_weight)
             return new_model
 
         # Train Red
@@ -390,7 +475,8 @@ class CatModelAdapter(ModelAdapter):
                  if pred_blue == target_blue:
                      hits += 1
                  total += 1
-        except Exception:
+        except Exception as e:
+            print(f"[CatBoost Eval Error] {e}")
             pass
             
         return hits / max(1, total)
@@ -405,6 +491,20 @@ class CatModelAdapter(ModelAdapter):
             delta = random.choice([-1, 1])
             new_cfg["depth"] = max(4, min(10, new_cfg["depth"] + delta))
         return new_cfg
+
+    def save(self, member: Member, path: Path) -> None:
+        """Save member checkpoint for PBT."""
+        path.mkdir(parents=True, exist_ok=True)
+        import pickle
+        with open(path / "catboost_pbt.pkl", "wb") as f:
+            pickle.dump(member.model_state, f)
+
+    def load(self, path: Path) -> Member:
+        """Load member checkpoint for PBT."""
+        import pickle
+        with open(path / "catboost_pbt.pkl", "rb") as f:
+            model_state = pickle.load(f)
+        return Member(id=0, step=0, config={}, model_state=model_state)
 
 
 class CatBoostPredictor(BasePredictor):

@@ -42,17 +42,17 @@ class FeatureStore:
                 cached_df = pd.read_parquet(cache_path)
                 # Verify length matches (simple integrity check)
                 if len(cached_df) == len(df):
-                    logger.info(f"[FeatureStore] Hit cache: {cache_path.name}")
+                    logger.debug(f"[FeatureStore] Hit cache: {cache_path.name}")
                     return cached_df
             except Exception as e:
                 logger.warning(f"[FeatureStore] Read cache failed: {e}")
         
-        logger.info(f"[FeatureStore] Computing features ({suffix})...")
+        logger.debug(f"[FeatureStore] Computing features ({suffix})...")
         res_df = compute_fn(df)
         
         try:
             res_df.to_parquet(cache_path, index=False)
-            logger.info(f"[FeatureStore] Saved cache: {cache_path.name}")
+            logger.debug(f"[FeatureStore] Saved cache: {cache_path.name}")
         except Exception as e:
             logger.warning(f"[FeatureStore] Save cache failed: {e}")
             
